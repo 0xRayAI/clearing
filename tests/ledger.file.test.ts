@@ -43,7 +43,7 @@ describe('file ledger', () => {
       const past = new Date(Date.now() - 5_000);
       utimesSync(lock, past, past);
       const second = acquireLedgerLock(lock);
-      releaseLedgerLock(lock, first);
+      expect(releaseLedgerLock(lock, first)).toBe('lost');
       expect(existsSync(lock)).toBe(true);
       expect(readFileSync(lock, 'utf8')).toBe(second.token);
       releaseLedgerLock(lock, second);
@@ -85,6 +85,53 @@ describe('file ledger', () => {
     } finally {
       if (previous === undefined) delete process.env.CLEARING_LEDGER_LOCK_STALE_MS;
       else process.env.CLEARING_LEDGER_LOCK_STALE_MS = previous;
+    }
+  });
+
+  it('a fresh holder is not evicted and steal does not throw on the old restore path', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clearing-ledger-fresh-'));
+    const lock = join(dir, 'receipts.jsonl.lock');
+    const log = join(dir, 'holders.log');
+    const previous = process.env.CLEARING_LEDGER_LOCK_STALE_MS;
+    process.env.CLEARING_LEDGER_LOCK_STALE_MS = '1000';
+    try {
+      const held = acquireLedgerLock(lock);
+      const child = enterLock(lock, log);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(readFileSync(lock, 'utf8')).toBe(held.token);
+      expect(existsSync(log)).toBe(false);
+      expect(releaseLedgerLock(lock, held)).toBe('released');
+      await child;
+      expect(holderDepth(readFileSync(log, 'utf8'))).toEqual({ max: 1, enters: 1, open: 0 });
+    } finally {
+      if (previous === undefined) delete process.env.CLEARING_LEDGER_LOCK_STALE_MS;
+      else process.env.CLEARING_LEDGER_LOCK_STALE_MS = previous;
+    }
+  });
+
+  it('a leftover grave and steal guard do not block the next acquire', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clearing-ledger-crash-'));
+    const lock = join(dir, 'receipts.jsonl.lock');
+    const previousLock = process.env.CLEARING_LEDGER_LOCK_STALE_MS;
+    const previousGuard = process.env.CLEARING_LEDGER_STEAL_STALE_MS;
+    process.env.CLEARING_LEDGER_LOCK_STALE_MS = '1000';
+    process.env.CLEARING_LEDGER_STEAL_STALE_MS = '1000';
+    try {
+      writeFileSync(lock, `0:${'ab'.repeat(16)}`);
+      writeFileSync(`${lock}.steal`, 'crashed-stealer');
+      writeFileSync(`${lock}.stale.0.${'cd'.repeat(8)}.deadbeef`, 'leftover-grave');
+      const past = new Date(Date.now() - 5_000);
+      utimesSync(lock, past, past);
+      utimesSync(`${lock}.steal`, past, past);
+      const held = acquireLedgerLock(lock);
+      expect(readFileSync(lock, 'utf8')).toBe(held.token);
+      expect(releaseLedgerLock(lock, held)).toBe('released');
+      expect(existsSync(lock)).toBe(false);
+    } finally {
+      if (previousLock === undefined) delete process.env.CLEARING_LEDGER_LOCK_STALE_MS;
+      else process.env.CLEARING_LEDGER_LOCK_STALE_MS = previousLock;
+      if (previousGuard === undefined) delete process.env.CLEARING_LEDGER_STEAL_STALE_MS;
+      else process.env.CLEARING_LEDGER_STEAL_STALE_MS = previousGuard;
     }
   });
 });
