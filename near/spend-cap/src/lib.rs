@@ -12,7 +12,11 @@
 //! - `Allowance::limited` and `add_access_key_allowance` (the allowance is gas):
 //!   https://docs.rs/near-sdk/5.7.0/near_sdk/struct.Promise.html
 //! - Function-call keys: https://docs.near.org/protocol/access-keys
-//! - `ft_transfer` attaches 1 yoctoNEAR: https://docs.near.org/primitives/ft
+//! - `ft_transfer` attaches 1 yoctoNEAR, and the sender must hold the amount:
+//!   https://github.com/near/NEPs/blob/master/neps/nep-0141.md
+//! - `storage_deposit` with `registration_only` runs before that transfer.
+//!   NEP-145 refunds the deposit when the account is already registered:
+//!   https://github.com/near/NEPs/blob/master/neps/nep-0145.md
 //!
 //! Allowance MIT notice: `near/spend-cap/THIRD_PARTY_NOTICES`.
 #![deny(unused)]
@@ -34,10 +38,16 @@ pub const AGENT_METHODS: &str = "pay,ping";
 /// Gas the agent key may burn. This is not a USDC budget.
 pub const KEY_GAS_ALLOWANCE: NearToken = NearToken::from_near(1);
 
+const GAS_STORAGE_DEPOSIT: Gas = Gas::from_tgas(15);
 const GAS_FT_TRANSFER: Gas = Gas::from_tgas(20);
 const GAS_ON_PAID: Gas = Gas::from_tgas(20);
 const MIN_GAS_PAY: Gas = Gas::from_tgas(80);
 const ONE_YOCTO: NearToken = NearToken::from_yoctonear(1);
+/// One account on the reference fungible token.
+/// near-contract-standards 5.7 measures it in `FungibleToken::new`
+/// (`measure_account_storage_usage`) and `storage_balance_bounds` multiplies
+/// that by the protocol byte cost, 10^19 yoctoNEAR. Excess is refunded.
+const FT_STORAGE_DEPOSIT: NearToken = NearToken::from_yoctonear(1_250_000_000_000_000_000_000);
 const MAX_MEMO_LEN: usize = 128;
 
 #[near(serializers = [borsh])]
@@ -71,6 +81,8 @@ pub struct SpendVault {
     max_open_approvals: u32,
     spent: u128,
     reserved: u128,
+    /// USDC held for an in-flight owner withdraw. `on_withdraw` releases it.
+    withdraw_inflight: u128,
     window_start_ns: u64,
     last_payment_ns: u64,
     next_approval: u64,
@@ -120,6 +132,7 @@ impl SpendVault {
             max_open_approvals,
             spent: 0,
             reserved: 0,
+            withdraw_inflight: 0,
             window_start_ns: 0,
             last_payment_ns: 0,
             next_approval: 1,
@@ -170,6 +183,30 @@ impl SpendVault {
         self.start_pay(receiver_id, amount.0, memo, false)
     }
 
+    /// Owner takes USDC out. The cap, window, and allowlist do not apply.
+    /// The agent key cannot call this: its method list is `pay,ping`, and a
+    /// function-call key cannot attach the 1 yoctoNEAR NEP-141 requires.
+    #[payable]
+    pub fn withdraw(&mut self, receiver_id: AccountId, amount: U128) -> Promise {
+        self.assert_owner();
+        require!(env::attached_deposit() == ONE_YOCTO, "attach 1 yoctoNEAR");
+        require!(amount.0 > 0, "amount must be positive");
+        require!(receiver_id != env::current_account_id(), "receiver must not be the vault");
+        require!(env::prepaid_gas() >= MIN_GAS_PAY, "attach at least 80 TGas");
+        self.withdraw_inflight = self
+            .withdraw_inflight
+            .checked_add(amount.0)
+            .unwrap_or_else(|| env::panic_str("withdraw overflow"));
+        self.transfer_out(
+            receiver_id,
+            amount.0,
+            Some("owner-withdraw".to_string()),
+            Self::ext(env::current_account_id())
+                .with_static_gas(GAS_ON_PAID)
+                .on_withdraw(U128(amount.0)),
+        )
+    }
+
     /// Owner confirms a pay that was above the approval threshold.
     pub fn confirm(&mut self, request_id: u64) -> Promise {
         self.assert_owner();
@@ -193,6 +230,15 @@ impl SpendVault {
         }
     }
 
+    /// The token keeps the vault's balance when `ft_transfer` fails.
+    /// Releasing the hold lets the owner withdraw that amount again.
+    #[private]
+    pub fn on_withdraw(&mut self, amount: U128) -> bool {
+        let ok = matches!(env::promise_result(0), PromiseResult::Successful(_));
+        self.withdraw_inflight = self.withdraw_inflight.saturating_sub(amount.0);
+        ok
+    }
+
     pub fn get_spent(&self) -> U128 {
         U128(self.spent)
     }
@@ -208,11 +254,16 @@ impl SpendVault {
     pub fn get_agent_methods(&self) -> String {
         AGENT_METHODS.to_string()
     }
+
+    pub fn get_withdraw_inflight(&self) -> U128 {
+        U128(self.withdraw_inflight)
+    }
 }
 
 #[near_sdk::ext_contract(ext_ft)]
 #[allow(dead_code)]
 trait FungibleToken {
+    fn storage_deposit(&mut self, account_id: Option<AccountId>, registration_only: Option<bool>);
     fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>);
 }
 
@@ -293,18 +344,40 @@ impl SpendVault {
             Ok(Decision::Pay) => {
                 require!(env::prepaid_gas() >= MIN_GAS_PAY, "attach at least 80 TGas");
                 self.reserve(amount);
-                let promise = ext_ft::ext(self.token_id.clone())
-                    .with_attached_deposit(ONE_YOCTO)
-                    .with_static_gas(GAS_FT_TRANSFER)
-                    .ft_transfer(receiver_id, U128(amount), Some(memo))
-                    .then(
-                        Self::ext(env::current_account_id())
-                            .with_static_gas(GAS_ON_PAID)
-                            .on_paid(U128(amount)),
-                    );
+                let promise = self.transfer_out(
+                    receiver_id,
+                    amount,
+                    Some(memo),
+                    Self::ext(env::current_account_id())
+                        .with_static_gas(GAS_ON_PAID)
+                        .on_paid(U128(amount)),
+                );
                 PromiseOrValue::Promise(promise)
             }
         }
+    }
+
+    /// NEP-145 registration, then NEP-141 transfer. The callback's
+    /// `promise_result(0)` is the transfer. A failed registration still
+    /// reaches the callback, which releases the reserved amount.
+    fn transfer_out(
+        &self,
+        receiver_id: AccountId,
+        amount: u128,
+        memo: Option<String>,
+        callback: Promise,
+    ) -> Promise {
+        ext_ft::ext(self.token_id.clone())
+            .with_attached_deposit(FT_STORAGE_DEPOSIT)
+            .with_static_gas(GAS_STORAGE_DEPOSIT)
+            .storage_deposit(Some(receiver_id.clone()), Some(true))
+            .then(
+                ext_ft::ext(self.token_id.clone())
+                    .with_attached_deposit(ONE_YOCTO)
+                    .with_static_gas(GAS_FT_TRANSFER)
+                    .ft_transfer(receiver_id, U128(amount), memo),
+            )
+            .then(callback)
     }
 
     fn reserve(&mut self, amount: u128) {
@@ -463,5 +536,62 @@ mod tests {
         set_owner(1_000);
         let rolled = spend.pay(shop(), U128(1_000_000), "nonce-d".to_string());
         assert!(matches!(rolled, PromiseOrValue::Promise(_)));
+    }
+
+    fn set_owner_deposit(now: u64, deposit: NearToken) {
+        let ctx = VMContextBuilder::new()
+            .current_account_id(vault())
+            .predecessor_account_id(owner())
+            .signer_account_id(owner())
+            .block_timestamp(now)
+            .prepaid_gas(Gas::from_tgas(300))
+            .attached_deposit(deposit)
+            .account_balance(NearToken::from_near(20))
+            .build();
+        testing_env!(ctx);
+    }
+
+    #[test]
+    fn withdraw_rejects_anyone_but_the_owner() {
+        let mut spend = open_vault();
+        let ctx = VMContextBuilder::new()
+            .current_account_id(vault())
+            .predecessor_account_id(shop())
+            .signer_account_id(shop())
+            .prepaid_gas(Gas::from_tgas(300))
+            .attached_deposit(ONE_YOCTO)
+            .build();
+        testing_env!(ctx);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            spend.withdraw(shop(), U128(1));
+        }));
+        assert!(caught.is_err());
+        assert_eq!(spend.get_withdraw_inflight().0, 0);
+    }
+
+    #[test]
+    fn a_failed_withdraw_releases_the_hold() {
+        let mut spend = open_vault();
+        set_owner_deposit(1, ONE_YOCTO);
+        let _ = spend.withdraw(shop(), U128(50));
+        assert_eq!(spend.get_withdraw_inflight().0, 50);
+        assert_eq!(spend.get_spent().0, 0);
+        assert_eq!(spend.get_reserved().0, 0);
+        let ctx = VMContextBuilder::new()
+            .current_account_id(vault())
+            .predecessor_account_id(vault())
+            .block_timestamp(2)
+            .prepaid_gas(Gas::from_tgas(300))
+            .build();
+        testing_env!(
+            ctx,
+            near_sdk::test_vm_config(),
+            near_sdk::RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![PromiseResult::Failed],
+        );
+        assert!(!spend.on_withdraw(U128(50)));
+        assert_eq!(spend.get_withdraw_inflight().0, 0);
+        assert_eq!(spend.get_spent().0, 0);
     }
 }
