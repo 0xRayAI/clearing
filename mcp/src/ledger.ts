@@ -4,9 +4,11 @@ import {
   closeSync,
   constants,
   existsSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
   statSync,
   unlinkSync,
   writeSync,
@@ -83,9 +85,8 @@ export class FileLedger extends MemoryLedger {
 
   /**
    * Append-only. A later line for the same paymentId wins on load.
-   * Exclusive lock is O_CREAT|O_EXCL (open(2)). Release unlinks only the
-   * owner token written at create. A stale lock is removed only when a
-   * second read still shows that same token and mtime.
+   * Exclusive lock is O_CREAT|O_EXCL (open(2)). Steal and release take the
+   * directory entry with rename, then unlink only the renamed file.
    */
   override put(receipt: Receipt): void {
     super.put(receipt);
@@ -127,19 +128,25 @@ export function acquireLedgerLock(path: string): LedgerLock {
   }
 }
 
-/** Unlink only when the file still contains the token this holder wrote. */
+/**
+ * Drop our lock. rename claims the directory entry. The loser sees ENOENT
+ * and leaves the file alone. We unlink only the renamed file, and only when
+ * it still holds our token.
+ */
 export function releaseLedgerLock(path: string, held: LedgerLock): void {
   try {
     closeSync(held.fd);
   } catch {
     /* already closed */
   }
+  const grave = `${path}.rel.${held.token}`;
   try {
-    if (readFileSync(path, 'utf8') !== held.token) return;
-    unlinkSync(path);
-  } catch {
-    /* the file is already gone */
+    renameSync(path, grave);
+  } catch (err) {
+    if (errorCode(err) === 'ENOENT') return;
+    throw err;
   }
+  settleRenamed(path, grave, held.token, false);
 }
 
 function lockSnapshot(path: string): { token: string; mtimeMs: number } | undefined {
@@ -150,22 +157,78 @@ function lockSnapshot(path: string): { token: string; mtimeMs: number } | undefi
   }
 }
 
+function errorCode(err: unknown): string | undefined {
+  return (err as NodeJS.ErrnoException).code;
+}
+
+function isStale(mtimeMs: number): boolean {
+  return Date.now() - mtimeMs > staleLockMs();
+}
+
 /**
- * Remove a lock older than the stale window. A second read of the token and
- * mtime must still match, so a lock a new owner just created is left in place.
+ * Take a stale lock by renaming it aside. Only one rename wins. ENOENT means
+ * another stealer or a release already moved `path`, so the caller retries
+ * the exclusive create. The token and mtime are checked on the renamed file,
+ * and only that file is unlinked.
  */
 function stealStaleLock(path: string): boolean {
   const seen = lockSnapshot(path);
-  if (!seen || Date.now() - seen.mtimeMs <= staleLockMs()) return false;
-  const again = lockSnapshot(path);
-  if (!again || again.token !== seen.token || again.mtimeMs !== seen.mtimeMs) return false;
-  if (Date.now() - again.mtimeMs <= staleLockMs()) return false;
+  if (!seen || !isStale(seen.mtimeMs)) return false;
+  const grave = `${path}.stale.${seen.token}`;
+  if (existsSync(grave)) return false;
   try {
-    unlinkSync(path);
-    return true;
-  } catch {
-    return false;
+    renameSync(path, grave);
+  } catch (err) {
+    if (errorCode(err) === 'ENOENT') return false;
+    throw err;
   }
+  return settleRenamed(path, grave, seen.token, true);
+}
+
+/**
+ * Unlink `grave` when it is the file we meant to drop. Never unlink `path`.
+ *
+ * A token mismatch, or a file that is still fresh, is put back with
+ * linkSync(grave, path) and then the renamed name is removed. linkSync
+ * throws EEXIST when a new lock already occupies `path`. A stale renamed
+ * file is then deleted, because the live lock is the one at `path`. A fresh
+ * renamed file is kept and this throws. Deleting it would drop a lock a
+ * holder still has, and overwriting `path` would drop the new lock. Leaving
+ * the fresh file at `grave` is the fail-closed choice.
+ */
+function settleRenamed(path: string, grave: string, expectedToken: string, requireStale: boolean): boolean {
+  const moved = lockSnapshot(grave);
+  if (!moved) return false;
+  const stale = isStale(moved.mtimeMs);
+  const expected = moved.token === expectedToken && (!requireStale || stale);
+  if (expected) {
+    try {
+      unlinkSync(grave);
+    } catch {
+      /* already gone */
+    }
+    return true;
+  }
+  try {
+    linkSync(grave, path);
+  } catch (err) {
+    if (errorCode(err) !== 'EEXIST') throw err;
+    if (stale) {
+      try {
+        unlinkSync(grave);
+      } catch {
+        /* already gone */
+      }
+      return false;
+    }
+    throw new Error(`ledger lock fail closed: ${grave} is a fresh lock and ${path} is already taken`);
+  }
+  try {
+    unlinkSync(grave);
+  } catch {
+    /* already gone */
+  }
+  return false;
 }
 
 function sleepMs(ms: number): void {

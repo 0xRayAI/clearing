@@ -1,6 +1,9 @@
-import { existsSync, mkdtempSync, readFileSync, utimesSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { acquireLedgerLock, FileLedger, ledgerPath, releaseLedgerLock } from '../mcp/src/ledger.js';
 import type { Receipt } from '../mcp/src/types.js';
@@ -50,4 +53,77 @@ describe('file ledger', () => {
       else process.env.CLEARING_LEDGER_LOCK_STALE_MS = previous;
     }
   });
+
+  it('three processes stealing one aged lock never overlap', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clearing-ledger-steal-'));
+    const lock = join(dir, 'receipts.jsonl.lock');
+    const log = join(dir, 'holders.log');
+    writeFileSync(lock, `0:${'ab'.repeat(16)}`);
+    const past = new Date(Date.now() - 5_000);
+    utimesSync(lock, past, past);
+    await Promise.all([enterLock(lock, log), enterLock(lock, log), enterLock(lock, log)]);
+    expect(holderDepth(readFileSync(log, 'utf8'))).toEqual({ max: 1, enters: 3, open: 0 });
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it('a release racing the stealers does not drop the new owner', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clearing-ledger-release-'));
+    const lock = join(dir, 'receipts.jsonl.lock');
+    const log = join(dir, 'holders.log');
+    const previous = process.env.CLEARING_LEDGER_LOCK_STALE_MS;
+    process.env.CLEARING_LEDGER_LOCK_STALE_MS = '1000';
+    try {
+      const held = acquireLedgerLock(lock);
+      const past = new Date(Date.now() - 5_000);
+      utimesSync(lock, past, past);
+      const racers = Promise.all([enterLock(lock, log), enterLock(lock, log), enterLock(lock, log)]);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      releaseLedgerLock(lock, held);
+      await racers;
+      expect(holderDepth(readFileSync(log, 'utf8'))).toEqual({ max: 1, enters: 3, open: 0 });
+      expect(existsSync(lock)).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.CLEARING_LEDGER_LOCK_STALE_MS;
+      else process.env.CLEARING_LEDGER_LOCK_STALE_MS = previous;
+    }
+  });
 });
+
+function holderDepth(log: string): { max: number; enters: number; open: number } {
+  let open = 0;
+  let max = 0;
+  let enters = 0;
+  for (const line of log.split('\n')) {
+    if (line.startsWith('enter ')) {
+      open += 1;
+      enters += 1;
+      if (open > max) max = open;
+    } else if (line.startsWith('exit ')) {
+      open -= 1;
+    }
+  }
+  return { max, enters, open };
+}
+
+function enterLock(lock: string, log: string): Promise<void> {
+  const worker = fileURLToPath(new URL('./ledger-lock-worker.ts', import.meta.url));
+  const tsx = createRequire(import.meta.url).resolve('tsx/cli');
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [tsx, worker, lock, log], {
+      cwd: dirname(worker),
+      env: { ...process.env, CLEARING_LEDGER_LOCK_STALE_MS: '1000' },
+    });
+    let err = '';
+    child.stderr.on('data', (chunk: Buffer) => {
+      err += chunk.toString();
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`lock worker ${code}: ${err}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
