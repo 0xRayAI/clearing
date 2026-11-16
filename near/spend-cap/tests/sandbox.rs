@@ -185,13 +185,29 @@ async fn budget_window_exhausted_rejected() {
 
 #[tokio::test]
 async fn budget_window_rolls_over() {
-    // Chain time follows the host clock in the sandbox. A 2s window can
-    // elapse between two pays when the suite runs in parallel.
     let rig = rig(CAP, 60 * SEC).await;
     must(pay(&rig, CAP, "nonce-window").await);
     let blocked = pay(&rig, 1, "nonce-blocked").await;
     assert!(!blocked.is_success(), "second pay in the window must fail");
-    rig.worker.fast_forward(120).await.expect("fast forward");
+    // nearcore sandbox fast config produces blocks every (120ms+500ms)/2.
+    // fast_forward(120) is about 37s, which can stay inside this 60s window.
+    // near-workspaces `Worker::fast_forward` moves block height and
+    // `Block::timestamp` (nanoseconds). Keep going until that clock has
+    // passed a full window, then require the next pay to succeed.
+    let marked = rig.worker.view_block().await.expect("block").timestamp();
+    let mut now = marked;
+    for _ in 0..8 {
+        if now.saturating_sub(marked) > 60 * SEC {
+            break;
+        }
+        rig.worker.fast_forward(400).await.expect("fast forward");
+        now = rig.worker.view_block().await.expect("block").timestamp();
+    }
+    assert!(
+        now.saturating_sub(marked) > 60 * SEC,
+        "block_timestamp moved {} ns, the 60s window is still open",
+        now.saturating_sub(marked)
+    );
     must(pay(&rig, CAP, "nonce-next-window").await);
     assert_eq!(balance(&rig.token, rig.shop.id()).await, CAP * 2);
 }
@@ -273,9 +289,48 @@ async fn agent_key_cannot_call_ft_transfer() {
 }
 
 #[tokio::test]
-async fn pay_unregistered_receiver_succeeds() {
+async fn empty_allowlist_pay_to_unregistered_releases_without_storage() {
     let rig = rig(5_000_000, 60 * SEC).await;
     let fresh = rig.worker.dev_create_account().await.expect("fresh");
+    let tokens_before = balance(&rig.token, rig.vault.id()).await;
+    let near_before = rig.worker.view_account(rig.vault.id()).await.expect("account").balance;
+    let failed = rig
+        .owner
+        .call(rig.vault.id(), "pay")
+        .args_json(json!({
+            "receiver_id": fresh.id(),
+            "amount": "1",
+            "memo": "nonce-empty-allow",
+        }))
+        .gas(Gas::from_tgas(150))
+        .transact()
+        .await
+        .expect("pay submitted");
+    assert!(!failed.receipt_failures().is_empty(), "unregistered pay must fail: {:?}", failed.failures());
+    assert_eq!(balance(&rig.token, rig.vault.id()).await, tokens_before);
+    assert_eq!(balance(&rig.token, fresh.id()).await, 0);
+    let reserved: String = rig.vault.view("get_reserved").await.expect("view").json().expect("json");
+    assert_eq!(reserved, "0");
+    let near_after = rig.worker.view_account(rig.vault.id()).await.expect("account").balance;
+    let dropped = near_before.as_yoctonear().saturating_sub(near_after.as_yoctonear());
+    assert!(
+        dropped < 1_250_000_000_000_000_000_000,
+        "vault NEAR dropped by {dropped}, storage deposit is 0.00125 NEAR"
+    );
+}
+
+#[tokio::test]
+async fn allowlisted_unregistered_receiver_succeeds() {
+    let rig = rig(5_000_000, 60 * SEC).await;
+    let fresh = rig.worker.dev_create_account().await.expect("fresh");
+    must(
+        rig.owner
+            .call(rig.vault.id(), "set_allow")
+            .args_json(json!({ "allow": [fresh.id()] }))
+            .transact()
+            .await
+            .expect("allow"),
+    );
     let before = balance(&rig.token, rig.vault.id()).await;
     must(
         rig.owner
@@ -283,7 +338,7 @@ async fn pay_unregistered_receiver_succeeds() {
             .args_json(json!({
                 "receiver_id": fresh.id(),
                 "amount": CAP.to_string(),
-                "memo": "nonce-unregistered-shop",
+                "memo": "nonce-allowlisted",
             }))
             .gas(Gas::from_tgas(150))
             .transact()
@@ -292,8 +347,6 @@ async fn pay_unregistered_receiver_succeeds() {
     );
     assert_eq!(balance(&rig.token, fresh.id()).await, CAP);
     assert_eq!(balance(&rig.token, rig.vault.id()).await, before - CAP);
-    let reserved: String = rig.vault.view("get_reserved").await.expect("view").json().expect("json");
-    assert_eq!(reserved, "0");
 }
 
 #[tokio::test]
@@ -324,6 +377,14 @@ async fn owner_withdraw_restores_on_failure_then_pays_out() {
     assert_eq!(inflight, "0");
     let spent: String = rig.vault.view("get_spent").await.expect("view").json().expect("json");
     assert_eq!(spent, "0");
+    must(
+        rig.owner
+            .call(rig.vault.id(), "set_allow")
+            .args_json(json!({ "allow": [fresh.id()] }))
+            .transact()
+            .await
+            .expect("allow"),
+    );
 
     let out = CAP * 2;
     must(

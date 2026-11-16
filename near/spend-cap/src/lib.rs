@@ -14,8 +14,9 @@
 //! - Function-call keys: https://docs.near.org/protocol/access-keys
 //! - `ft_transfer` attaches 1 yoctoNEAR, and the sender must hold the amount:
 //!   https://github.com/near/NEPs/blob/master/neps/nep-0141.md
-//! - `storage_deposit` with `registration_only` runs before that transfer.
-//!   NEP-145 refunds the deposit when the account is already registered:
+//! - `storage_deposit` with `registration_only` runs before `ft_transfer`
+//!   only for an allowlisted receiver. An empty allowlist sends `ft_transfer`
+//!   alone, so a fresh account cannot spend the vault's NEAR.
 //!   https://github.com/near/NEPs/blob/master/neps/nep-0145.md
 //!
 //! Allowance MIT notice: `near/spend-cap/THIRD_PARTY_NOTICES`.
@@ -39,9 +40,12 @@ pub const AGENT_METHODS: &str = "pay,ping";
 pub const KEY_GAS_ALLOWANCE: NearToken = NearToken::from_near(1);
 
 const GAS_STORAGE_DEPOSIT: Gas = Gas::from_tgas(15);
+const GAS_FT_BALANCE: Gas = Gas::from_tgas(10);
 const GAS_FT_TRANSFER: Gas = Gas::from_tgas(20);
 const GAS_ON_PAID: Gas = Gas::from_tgas(20);
+const GAS_ON_WITHDRAW_CHECK: Gas = Gas::from_tgas(80);
 const MIN_GAS_PAY: Gas = Gas::from_tgas(80);
+const MIN_GAS_WITHDRAW: Gas = Gas::from_tgas(120);
 const ONE_YOCTO: NearToken = NearToken::from_yoctonear(1);
 /// One account on the reference fungible token.
 /// near-contract-standards 5.7 measures it in `FungibleToken::new`
@@ -192,19 +196,15 @@ impl SpendVault {
         require!(env::attached_deposit() == ONE_YOCTO, "attach 1 yoctoNEAR");
         require!(amount.0 > 0, "amount must be positive");
         require!(receiver_id != env::current_account_id(), "receiver must not be the vault");
-        require!(env::prepaid_gas() >= MIN_GAS_PAY, "attach at least 80 TGas");
-        self.withdraw_inflight = self
-            .withdraw_inflight
-            .checked_add(amount.0)
-            .unwrap_or_else(|| env::panic_str("withdraw overflow"));
-        self.transfer_out(
-            receiver_id,
-            amount.0,
-            Some("owner-withdraw".to_string()),
-            Self::ext(env::current_account_id())
-                .with_static_gas(GAS_ON_PAID)
-                .on_withdraw(U128(amount.0)),
-        )
+        require!(env::prepaid_gas() >= MIN_GAS_WITHDRAW, "attach at least 120 TGas");
+        ext_ft::ext(self.token_id.clone())
+            .with_static_gas(GAS_FT_BALANCE)
+            .ft_balance_of(env::current_account_id())
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_ON_WITHDRAW_CHECK)
+                    .on_withdraw_check(receiver_id, amount),
+            )
     }
 
     /// Owner confirms a pay that was above the approval threshold.
@@ -228,6 +228,35 @@ impl SpendVault {
         } else {
             self.release_reserve(amount.0);
         }
+    }
+
+    /// `balance - reserved - inflight` is what a withdraw may take.
+    /// In-flight pays still sit on this vault until `on_paid`.
+    #[private]
+    pub fn on_withdraw_check(&mut self, receiver_id: AccountId, amount: U128) -> Promise {
+        let balance = match env::promise_result(0) {
+            PromiseResult::Successful(bytes) => near_sdk::serde_json::from_slice::<U128>(&bytes)
+                .unwrap_or_else(|_| env::panic_str("bad balance"))
+                .0,
+            _ => env::panic_str("balance lookup failed"),
+        };
+        let held = self.reserved.saturating_add(self.withdraw_inflight);
+        let available = balance.saturating_sub(held);
+        require!(amount.0 <= available, "withdraw exceeds available balance");
+        self.withdraw_inflight = self
+            .withdraw_inflight
+            .checked_add(amount.0)
+            .unwrap_or_else(|| env::panic_str("withdraw overflow"));
+        let register = self.allow.iter().any(|id| id == &receiver_id);
+        self.transfer_out(
+            receiver_id,
+            amount.0,
+            Some("owner-withdraw".to_string()),
+            register,
+            Self::ext(env::current_account_id())
+                .with_static_gas(GAS_ON_PAID)
+                .on_withdraw(U128(amount.0)),
+        )
     }
 
     /// The token keeps the vault's balance when `ft_transfer` fails.
@@ -265,6 +294,7 @@ impl SpendVault {
 trait FungibleToken {
     fn storage_deposit(&mut self, account_id: Option<AccountId>, registration_only: Option<bool>);
     fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>);
+    fn ft_balance_of(&self, account_id: AccountId) -> U128;
 }
 
 impl SpendVault {
@@ -344,10 +374,12 @@ impl SpendVault {
             Ok(Decision::Pay) => {
                 require!(env::prepaid_gas() >= MIN_GAS_PAY, "attach at least 80 TGas");
                 self.reserve(amount);
+                let register = self.allow.iter().any(|id| id == &receiver_id);
                 let promise = self.transfer_out(
                     receiver_id,
                     amount,
                     Some(memo),
+                    register,
                     Self::ext(env::current_account_id())
                         .with_static_gas(GAS_ON_PAID)
                         .on_paid(U128(amount)),
@@ -357,27 +389,31 @@ impl SpendVault {
         }
     }
 
-    /// NEP-145 registration, then NEP-141 transfer. The callback's
-    /// `promise_result(0)` is the transfer. A failed registration still
-    /// reaches the callback, which releases the reserved amount.
+    /// NEP-141 transfer. `register` adds NEP-145 `storage_deposit` first,
+    /// and only an allowlisted receiver sets that flag. The callback's
+    /// `promise_result(0)` is the transfer either way.
     fn transfer_out(
         &self,
         receiver_id: AccountId,
         amount: u128,
         memo: Option<String>,
+        register: bool,
         callback: Promise,
     ) -> Promise {
-        ext_ft::ext(self.token_id.clone())
-            .with_attached_deposit(FT_STORAGE_DEPOSIT)
-            .with_static_gas(GAS_STORAGE_DEPOSIT)
-            .storage_deposit(Some(receiver_id.clone()), Some(true))
-            .then(
-                ext_ft::ext(self.token_id.clone())
-                    .with_attached_deposit(ONE_YOCTO)
-                    .with_static_gas(GAS_FT_TRANSFER)
-                    .ft_transfer(receiver_id, U128(amount), memo),
-            )
-            .then(callback)
+        let transfer = ext_ft::ext(self.token_id.clone())
+            .with_attached_deposit(ONE_YOCTO)
+            .with_static_gas(GAS_FT_TRANSFER)
+            .ft_transfer(receiver_id.clone(), U128(amount), memo);
+        let transfer = if register {
+            ext_ft::ext(self.token_id.clone())
+                .with_attached_deposit(FT_STORAGE_DEPOSIT)
+                .with_static_gas(GAS_STORAGE_DEPOSIT)
+                .storage_deposit(Some(receiver_id), Some(true))
+                .then(transfer)
+        } else {
+            transfer
+        };
+        transfer.then(callback)
     }
 
     fn reserve(&mut self, amount: u128) {
@@ -538,19 +574,6 @@ mod tests {
         assert!(matches!(rolled, PromiseOrValue::Promise(_)));
     }
 
-    fn set_owner_deposit(now: u64, deposit: NearToken) {
-        let ctx = VMContextBuilder::new()
-            .current_account_id(vault())
-            .predecessor_account_id(owner())
-            .signer_account_id(owner())
-            .block_timestamp(now)
-            .prepaid_gas(Gas::from_tgas(300))
-            .attached_deposit(deposit)
-            .account_balance(NearToken::from_near(20))
-            .build();
-        testing_env!(ctx);
-    }
-
     #[test]
     fn withdraw_rejects_anyone_but_the_owner() {
         let mut spend = open_vault();
@@ -569,14 +592,7 @@ mod tests {
         assert_eq!(spend.get_withdraw_inflight().0, 0);
     }
 
-    #[test]
-    fn a_failed_withdraw_releases_the_hold() {
-        let mut spend = open_vault();
-        set_owner_deposit(1, ONE_YOCTO);
-        let _ = spend.withdraw(shop(), U128(50));
-        assert_eq!(spend.get_withdraw_inflight().0, 50);
-        assert_eq!(spend.get_spent().0, 0);
-        assert_eq!(spend.get_reserved().0, 0);
+    fn callback_env(results: Vec<PromiseResult>) {
         let ctx = VMContextBuilder::new()
             .current_account_id(vault())
             .predecessor_account_id(vault())
@@ -588,8 +604,39 @@ mod tests {
             near_sdk::test_vm_config(),
             near_sdk::RuntimeFeesConfig::test(),
             Default::default(),
-            vec![PromiseResult::Failed],
+            results,
         );
+    }
+
+    fn balance_result(amount: u128) -> PromiseResult {
+        PromiseResult::Successful(near_sdk::serde_json::to_vec(&U128(amount)).expect("json"))
+    }
+
+    #[test]
+    fn withdraw_rejects_more_than_balance_minus_reserved() {
+        let mut spend = open_vault();
+        spend.reserved = 400;
+        callback_env(vec![balance_result(1_000)]);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            spend.on_withdraw_check(shop(), U128(601));
+        }));
+        assert!(caught.is_err());
+        assert_eq!(spend.get_withdraw_inflight().0, 0);
+        callback_env(vec![balance_result(1_000)]);
+        let _ = spend.on_withdraw_check(shop(), U128(600));
+        assert_eq!(spend.get_withdraw_inflight().0, 600);
+        assert_eq!(spend.get_reserved().0, 400);
+    }
+
+    #[test]
+    fn a_failed_withdraw_releases_the_hold() {
+        let mut spend = open_vault();
+        callback_env(vec![balance_result(1_000)]);
+        let _ = spend.on_withdraw_check(shop(), U128(50));
+        assert_eq!(spend.get_withdraw_inflight().0, 50);
+        assert_eq!(spend.get_spent().0, 0);
+        assert_eq!(spend.get_reserved().0, 0);
+        callback_env(vec![PromiseResult::Failed]);
         assert!(!spend.on_withdraw(U128(50)));
         assert_eq!(spend.get_withdraw_inflight().0, 0);
         assert_eq!(spend.get_spent().0, 0);
