@@ -18,6 +18,7 @@ import { FileBlipsStore, MemoryBlipsStore, blipsPath, type BlipsStore } from './
 import { decodePayload } from './x402.js';
 import { FileCardStore, MemoryCardStore, cardsPath, type CardStore } from './card-store.js';
 import { createCardRegistrar, MemoryCardRegistrar, type CardRegistrar } from './card-register.js';
+import type { NearReceiptReader } from './near-rail.js';
 import type { ClearingConfig, FetchFn } from './types.js';
 
 export type JsRenderer = (url: string) => Promise<{ html: string; finalUrl: string }>;
@@ -39,6 +40,8 @@ export type ClearingContext = {
   cards: CardStore;
   cardRegistrar: CardRegistrar;
   renderer?: JsRenderer;
+  /** Test double for NEAR tx_status. Production uses the public testnet RPC. */
+  nearReceipts?: NearReceiptReader;
   resolveHost: (hostname: string) => Promise<string[]>;
   liveDiscoverOrigins: () => Set<string>;
   setLiveDiscoverOrigins: (origins: Set<string>) => void;
@@ -61,6 +64,7 @@ export type ContextOverrides = {
   cards?: CardStore;
   cardRegistrar?: CardRegistrar;
   renderer?: JsRenderer;
+  nearReceipts?: NearReceiptReader;
   resolveHost?: (hostname: string) => Promise<string[]>;
   persist?: boolean;
 };
@@ -146,6 +150,7 @@ export function createContext(overrides: ContextOverrides = {}): ClearingContext
             rpcUrl: process.env.CLEARING_RPC_URL,
           })),
     renderer: overrides.renderer,
+    nearReceipts: overrides.nearReceipts,
     resolveHost: overrides.resolveHost ?? (async (hostname) => {
       const { promises: dns } = await import('node:dns');
       const records = await dns.lookup(hostname, { all: true });

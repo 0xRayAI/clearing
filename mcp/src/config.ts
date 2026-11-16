@@ -2,6 +2,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fail } from './errors.js';
+import { isNearAccountId } from './near-rail.js';
 import { isHexAddress, normalizeAddress } from './bytes.js';
 import {
   ALWAYS_ALLOW_ORIGIN,
@@ -112,7 +113,15 @@ export function defaultConfig(overrides: Partial<ClearingConfig> = {}): Clearing
     sessionToken: overrides.sessionToken ?? env('CLEARING_SESSION_TOKEN'),
     listedSeed: overrides.listedSeed ?? defaultListedSeed(),
     blipsNft: parseOptionalAddress(overrides.blipsNft ?? env('BLIPS_NFT') ?? env('BLIPS_NFT_ADDRESS')),
+    nearPayTo: parseNearPayTo(overrides.nearPayTo ?? env('CLEARING_NEAR_PAY_TO')),
   };
+}
+
+function parseNearPayTo(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const id = raw.trim().toLowerCase();
+  if (!isNearAccountId(id)) fail('config', 'CLEARING_NEAR_PAY_TO must be a NEAR account id');
+  return id;
 }
 
 function parseOptionalAddress(raw: string | undefined): import('./types.js').HexAddress | undefined {
