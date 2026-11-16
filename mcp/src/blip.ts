@@ -122,7 +122,7 @@ export async function handleBlip(req: Request, ctx: ClearingContext): Promise<Re
   );
   const nearPayTo = ctx.config.nearPayTo;
   if (nearPayTo) {
-    const issued = issueNearQuote({
+    const issued = issueNearQuote(ctx.ledger, {
       receiver: nearPayTo,
       amount: requirements.maxAmountRequired,
       nowMs: ctx.now().getTime(),
@@ -153,6 +153,7 @@ export async function handleBlip(req: Request, ctx: ClearingContext): Promise<Re
       return json({ error: 'ownerWallet required (owner=)', paid: false }, 400);
     }
     const verdict = await verifyPayment({
+      ledger: ctx.ledger,
       txHash: nearAttempt.txHash,
       senderAccountId: nearAttempt.senderAccountId,
       nonce: nearAttempt.nonce,
@@ -181,7 +182,7 @@ export async function handleBlip(req: Request, ctx: ClearingContext): Promise<Re
         amountUsd,
         paymentHeader,
         requirements,
-        nearPaid: { txHash: verdict.txHash },
+        nearPaid: { txHash: verdict.txHash, senderAccountId: verdict.senderAccountId },
       }),
     );
   }
@@ -228,7 +229,7 @@ async function fulfillPaidBlip(args: {
   amountUsd: number;
   paymentHeader: string;
   requirements: PaymentRequirements;
-  nearPaid?: { txHash: string };
+  nearPaid?: { txHash: string; senderAccountId: string };
 }): Promise<Response> {
   const {
     ctx,
@@ -375,14 +376,27 @@ async function fulfillPaidBlip(args: {
   });
 
   try {
-    ctx.settlements.add({
-      from: ownerWallet,
-      to: ctx.config.payTo,
-      amountUsd: String(amountUsd),
-      at: ctx.now().toISOString(),
-      txHash: (settle.txHash ?? minted.mintTx) as HexAddress,
-      tag: 'external',
-    });
+    if (nearPaid && ctx.config.nearPayTo) {
+      ctx.settlements.add({
+        from: nearPaid.senderAccountId,
+        to: ctx.config.nearPayTo,
+        amountUsd: String(amountUsd),
+        at: ctx.now().toISOString(),
+        txHash: nearPaid.txHash,
+        chain: 'near:testnet',
+        tag: 'external',
+      });
+    } else {
+      ctx.settlements.add({
+        from: ownerWallet,
+        to: ctx.config.payTo,
+        amountUsd: String(amountUsd),
+        at: ctx.now().toISOString(),
+        txHash: (settle.txHash ?? minted.mintTx) as HexAddress,
+        chain: 'eip155:8453',
+        tag: 'external',
+      });
+    }
   } catch {
     /* discover can lag */
   }
@@ -411,7 +425,7 @@ async function fulfillPaidBlip(args: {
       escalator: BLIPS_ESCALATOR_KIND,
       formula: BLIPS_ESCALATOR_FORMULA,
       mintIndexSource: 'settledPaid',
-      chainId: 8453,
+      ...(nearPaid ? { chain: 'near:testnet' as const } : { chainId: 8453 }),
       collection: 'Blips',
       market: false,
     },

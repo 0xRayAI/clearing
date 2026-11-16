@@ -1,21 +1,27 @@
-import { describe, expect, it, beforeEach } from 'vitest';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { handleBlip } from '../mcp/src/blip.js';
 import { MemoryFacilitator } from '../mcp/src/facilitator.js';
+import { FileLedger, ledgerPath, MemoryLedger } from '../mcp/src/ledger.js';
 import {
   CIRCLE_USDC_NEAR_TESTNET,
   encodeNearPayment,
   issueNearQuote,
   NEAR_QUOTE_TTL_MS,
-  resetNearRailForTests,
+  nearQuotePaymentId,
   transferFromTxStatus,
   verifyPayment,
   type NearTransferView,
 } from '../mcp/src/near-rail.js';
+import type { Ledger } from '../mcp/src/ledger.js';
 import { makeCtx, PAYER_A } from './helpers.js';
 
 const FOUNDRY = 'foundry.testnet';
 const SENDER = 'vault.testnet';
 const AMOUNT = '50000';
+const RELAYER = 'relayer.testnet';
 
 function view(over: Partial<NearTransferView> = {}): NearTransferView {
   return {
@@ -34,137 +40,127 @@ function reader(seen: NearTransferView) {
   return async () => seen;
 }
 
+function openLedger(): Ledger {
+  return new MemoryLedger();
+}
+
+function issue(ledger: Ledger, nowMs = 0) {
+  return issueNearQuote(ledger, { receiver: FOUNDRY, amount: AMOUNT, nowMs });
+}
+
+function check(
+  ledger: Ledger,
+  nonce: string,
+  txHash: string,
+  seen: NearTransferView,
+  nowMs = 1,
+) {
+  return verifyPayment({
+    ledger,
+    txHash,
+    senderAccountId: SENDER,
+    nonce,
+    nowMs,
+    readReceipt: reader(seen),
+  });
+}
+
 describe('NEAR USDC rail', () => {
-  beforeEach(() => resetNearRailForTests());
+  let ledger: Ledger;
+  beforeEach(() => {
+    ledger = openLedger();
+  });
 
   it('rejects_wrong_receiver', async () => {
-    const quote = issueNearQuote({ receiver: FOUNDRY, amount: AMOUNT, nowMs: 0 });
-    const result = await verifyPayment({
-      txHash: 'tx-wrong-receiver',
-      senderAccountId: SENDER,
-      nonce: quote.nonce,
-      nowMs: 1,
-      readReceipt: reader(view({ receiverId: 'other.testnet', memo: quote.nonce })),
-    });
+    const quote = issue(ledger);
+    const result = await check(ledger, quote.nonce, 'tx-wrong-receiver', view({ receiverId: 'other.testnet', memo: quote.nonce }));
     expect(result).toEqual({ ok: false, code: 'wrong_receiver' });
   });
 
   it('rejects_amount_not_equal_quote', async () => {
-    const over = issueNearQuote({ receiver: FOUNDRY, amount: AMOUNT, nowMs: 0 });
-    const overpay = await verifyPayment({
-      txHash: 'tx-over',
-      senderAccountId: SENDER,
-      nonce: over.nonce,
-      nowMs: 1,
-      readReceipt: reader(view({ amount: '50001', memo: over.nonce })),
-    });
+    const over = issue(ledger);
+    const overpay = await check(ledger, over.nonce, 'tx-over', view({ amount: '50001', memo: over.nonce }));
     expect(overpay).toEqual({ ok: false, code: 'amount_not_equal' });
 
-    const under = issueNearQuote({ receiver: FOUNDRY, amount: AMOUNT, nowMs: 0 });
-    const underpay = await verifyPayment({
-      txHash: 'tx-under',
-      senderAccountId: SENDER,
-      nonce: under.nonce,
-      nowMs: 1,
-      readReceipt: reader(view({ amount: '49999', memo: under.nonce })),
-    });
+    const under = issue(ledger);
+    const underpay = await check(ledger, under.nonce, 'tx-under', view({ amount: '49999', memo: under.nonce }));
     expect(underpay).toEqual({ ok: false, code: 'amount_not_equal' });
   });
 
   it('rejects_missing_nonce', async () => {
-    const result = await verifyPayment({
-      txHash: 'tx-missing',
-      senderAccountId: SENDER,
-      nonce: 'never-issued',
-      nowMs: 1,
-      readReceipt: reader(view()),
-    });
+    const result = await check(ledger, 'never-issued', 'tx-missing', view());
     expect(result).toEqual({ ok: false, code: 'missing_nonce' });
   });
 
   it('rejects_nonce_past_180s_ttl', async () => {
-    const quote = issueNearQuote({ receiver: FOUNDRY, amount: AMOUNT, nowMs: 0 });
-    const result = await verifyPayment({
-      txHash: 'tx-late',
-      senderAccountId: SENDER,
-      nonce: quote.nonce,
-      nowMs: NEAR_QUOTE_TTL_MS + 1,
-      readReceipt: reader(view({ memo: quote.nonce })),
-    });
+    const quote = issue(ledger);
+    const result = await check(
+      ledger,
+      quote.nonce,
+      'tx-late',
+      view({ memo: quote.nonce }),
+      NEAR_QUOTE_TTL_MS + 1,
+    );
     expect(result).toEqual({ ok: false, code: 'nonce_past_ttl' });
   });
 
   it('rejects_replayed_nonce', async () => {
-    const quote = issueNearQuote({ receiver: FOUNDRY, amount: AMOUNT, nowMs: 0 });
-    const tx = 'tx-nonce-once';
-    const first = await verifyPayment({
-      txHash: tx,
-      senderAccountId: SENDER,
-      nonce: quote.nonce,
-      nowMs: 1,
-      readReceipt: reader(view({ memo: quote.nonce })),
-    });
+    const quote = issue(ledger);
+    const first = await check(ledger, quote.nonce, 'tx-nonce-once', view({ memo: quote.nonce }));
     expect(first.ok).toBe(true);
-    const second = await verifyPayment({
-      txHash: 'tx-nonce-again',
-      senderAccountId: SENDER,
-      nonce: quote.nonce,
-      nowMs: 2,
-      readReceipt: reader(view({ memo: quote.nonce })),
-    });
+    const second = await check(ledger, quote.nonce, 'tx-nonce-again', view({ memo: quote.nonce }), 2);
     expect(second).toEqual({ ok: false, code: 'replayed_nonce' });
   });
 
   it('rejects_replayed_tx_hash', async () => {
-    const firstQuote = issueNearQuote({ receiver: FOUNDRY, amount: AMOUNT, nowMs: 0 });
-    const tx = 'tx-replay';
-    const first = await verifyPayment({
-      txHash: tx,
-      senderAccountId: SENDER,
-      nonce: firstQuote.nonce,
-      nowMs: 1,
-      readReceipt: reader(view({ memo: firstQuote.nonce })),
-    });
+    const firstQuote = issue(ledger);
+    const first = await check(ledger, firstQuote.nonce, 'tx-replay', view({ memo: firstQuote.nonce }));
     expect(first.ok).toBe(true);
-    const secondQuote = issueNearQuote({ receiver: FOUNDRY, amount: AMOUNT, nowMs: 2 });
-    const second = await verifyPayment({
-      txHash: tx,
-      senderAccountId: SENDER,
-      nonce: secondQuote.nonce,
-      nowMs: 3,
-      readReceipt: reader(view({ memo: secondQuote.nonce })),
-    });
+    const secondQuote = issue(ledger, 2);
+    const second = await check(ledger, secondQuote.nonce, 'tx-replay', view({ memo: secondQuote.nonce }), 3);
     expect(second).toEqual({ ok: false, code: 'replayed_tx' });
   });
 
   it('rejects_non_final_or_failed_status', async () => {
-    const pending = issueNearQuote({ receiver: FOUNDRY, amount: AMOUNT, nowMs: 0 });
-    const notFinal = await verifyPayment({
-      txHash: 'tx-pending',
-      senderAccountId: SENDER,
-      nonce: pending.nonce,
-      nowMs: 1,
-      readReceipt: reader(view({ finalExecutionStatus: 'EXECUTED', memo: pending.nonce })),
-    });
+    const pending = issue(ledger);
+    const notFinal = await check(
+      ledger,
+      pending.nonce,
+      'tx-pending',
+      view({ finalExecutionStatus: 'EXECUTED', memo: pending.nonce }),
+    );
     expect(notFinal).toEqual({ ok: false, code: 'not_final' });
 
-    const failed = issueNearQuote({ receiver: FOUNDRY, amount: AMOUNT, nowMs: 0 });
-    const failedTx = await verifyPayment({
-      txHash: 'tx-failed',
-      senderAccountId: SENDER,
-      nonce: failed.nonce,
-      nowMs: 1,
-      readReceipt: reader(view({ executionSucceeded: false, memo: failed.nonce })),
-    });
+    const failed = issue(ledger);
+    const failedTx = await check(
+      ledger,
+      failed.nonce,
+      'tx-failed',
+      view({ executionSucceeded: false, memo: failed.nonce }),
+    );
     expect(failedTx).toEqual({ ok: false, code: 'not_final' });
   });
 
-  it('reads memo from the nep141 event log, not from a caller quote', () => {
-    const parsed = transferFromTxStatus(
+  it('args memo and event memo must agree; the Circle tx has deposit in both', () => {
+    // Circle testnet USDC tx 53LCBQv92Fp2h19FAnpx1Ng4NacFz1Ncxf3dbnZf47C.
+    // memo "deposit" is in the ft_transfer args and the nep141 EVENT_JSON.
+    // Verified on 0xRayAI/xray#1148 comment 6913091316.
+    const args = Buffer.from(
+      JSON.stringify({
+        amount: '1000000',
+        memo: 'deposit',
+        receiver_id: 'shopkeeper.pcreh412610.testnet',
+      }),
+    ).toString('base64');
+    const agreed = transferFromTxStatus(
       {
         final_execution_status: 'FINAL',
         status: { SuccessValue: '' },
-        transaction: { signer_id: SENDER, receiver_id: CIRCLE_USDC_NEAR_TESTNET },
+        transaction: {
+          signer_id: 'p1.pcreh412610.testnet',
+          receiver_id: CIRCLE_USDC_NEAR_TESTNET,
+          actions: [{ FunctionCall: { method_name: 'ft_transfer', args } }],
+        },
         receipts_outcome: [
           {
             outcome: {
@@ -173,6 +169,81 @@ describe('NEAR USDC rail', () => {
                 `EVENT_JSON:${JSON.stringify({
                   standard: 'nep141',
                   version: '1.0.0',
+                  event: 'ft_transfer',
+                  data: [
+                    {
+                      old_owner_id: 'p1.pcreh412610.testnet',
+                      new_owner_id: 'shopkeeper.pcreh412610.testnet',
+                      amount: '1000000',
+                      memo: 'deposit',
+                    },
+                  ],
+                })}`,
+              ],
+            },
+          },
+        ],
+      },
+      'p1.pcreh412610.testnet',
+    );
+    expect(agreed.memo).toBe('deposit');
+    expect(agreed.memoConflict).toBe(false);
+    expect(agreed.tokenContract).toBe(CIRCLE_USDC_NEAR_TESTNET);
+
+    const clashArgs = Buffer.from(
+      JSON.stringify({ amount: AMOUNT, memo: 'args-memo', receiver_id: FOUNDRY }),
+    ).toString('base64');
+    const clash = transferFromTxStatus(
+      {
+        final_execution_status: 'FINAL',
+        status: { SuccessValue: '' },
+        transaction: {
+          signer_id: SENDER,
+          receiver_id: CIRCLE_USDC_NEAR_TESTNET,
+          actions: [{ FunctionCall: { method_name: 'ft_transfer', args: clashArgs } }],
+        },
+        receipts_outcome: [
+          {
+            outcome: {
+              executor_id: CIRCLE_USDC_NEAR_TESTNET,
+              logs: [
+                `EVENT_JSON:${JSON.stringify({
+                  standard: 'nep141',
+                  event: 'ft_transfer',
+                  data: [{ old_owner_id: SENDER, new_owner_id: FOUNDRY, amount: AMOUNT, memo: 'event-memo' }],
+                })}`,
+              ],
+            },
+          },
+        ],
+      },
+      SENDER,
+    );
+    expect(clash.memoConflict).toBe(true);
+  });
+
+  it('a relayed delegate is judged by the USDC receipt, not the outer receiver', () => {
+    const args = Buffer.from(
+      JSON.stringify({ amount: AMOUNT, memo: 'quote-nonce', receiver_id: FOUNDRY }),
+    ).toString('base64');
+    const parsed = transferFromTxStatus(
+      {
+        final_execution_status: 'FINAL',
+        status: { SuccessValue: '' },
+        transaction: { signer_id: RELAYER, receiver_id: SENDER, actions: [{ Delegate: {} }] },
+        receipts: [
+          {
+            receiver_id: CIRCLE_USDC_NEAR_TESTNET,
+            receipt: { Action: { actions: [{ FunctionCall: { method_name: 'ft_transfer', args } }] } },
+          },
+        ],
+        receipts_outcome: [
+          {
+            outcome: {
+              executor_id: CIRCLE_USDC_NEAR_TESTNET,
+              logs: [
+                `EVENT_JSON:${JSON.stringify({
+                  standard: 'nep141',
                   event: 'ft_transfer',
                   data: [{ old_owner_id: SENDER, new_owner_id: FOUNDRY, amount: AMOUNT, memo: 'quote-nonce' }],
                 })}`,
@@ -183,10 +254,39 @@ describe('NEAR USDC rail', () => {
       },
       SENDER,
     );
+    expect(parsed.tokenContract).toBe(CIRCLE_USDC_NEAR_TESTNET);
+    expect(parsed.tokenContract).not.toBe(SENDER);
+    expect(parsed.senderAccountId).toBe(SENDER);
     expect(parsed.memo).toBe('quote-nonce');
-    expect(parsed.amount).toBe(AMOUNT);
-    expect(parsed.receiverId).toBe(FOUNDRY);
     expect(parsed.executionSucceeded).toBe(true);
+  });
+
+  it('two parallel verifies of one nonce or one tx yield one success', async () => {
+    const quote = issue(ledger);
+    const [first, second] = await Promise.all([
+      check(ledger, quote.nonce, 'tx-race-a', view({ memo: quote.nonce })),
+      check(ledger, quote.nonce, 'tx-race-b', view({ memo: quote.nonce })),
+    ]);
+    expect([first, second].filter((row) => row.ok)).toHaveLength(1);
+
+    const left = issue(ledger, 2);
+    const right = issue(ledger, 3);
+    const [sameA, sameB] = await Promise.all([
+      check(ledger, left.nonce, 'tx-same', view({ memo: left.nonce }), 4),
+      check(ledger, right.nonce, 'tx-same', view({ memo: right.nonce }), 4),
+    ]);
+    expect([sameA, sameB].filter((row) => row.ok)).toHaveLength(1);
+  });
+
+  it('a second ledger opened on the same file sees the quote', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'near-rail-'));
+    const path = ledgerPath(dir);
+    const first = new FileLedger(path);
+    const quote = issueNearQuote(first, { receiver: FOUNDRY, amount: AMOUNT, nowMs: 0 });
+    const second = new FileLedger(path);
+    expect(second.get(nearQuotePaymentId(quote.nonce))?.status).toBe('quoted');
+    const body = second.get(nearQuotePaymentId(quote.nonce))?.body as { receiver?: string };
+    expect(body.receiver).toBe(FOUNDRY);
   });
 
   it('3.6 mock done: unpaid GET returns both accepts and a mocked FINAL receipt serves the blip', async () => {
@@ -222,10 +322,16 @@ describe('NEAR USDC rail', () => {
       ctx,
     );
     expect(paid?.status).toBe(200);
-    const body = (await paid!.json()) as { paid: boolean; videoUrl: string; txHash: string };
+    const body = (await paid!.json()) as { paid: boolean; videoUrl: string; txHash: string; chain?: string; chainId?: number };
     expect(body.paid).toBe(true);
     expect(body.videoUrl).toMatch(/\.mp4$/);
     expect(body.txHash).toBe('mock-final-tx');
+    expect(body.chain).toBe('near:testnet');
+    expect(body.chainId).toBeUndefined();
     expect((ctx.facilitator as MemoryFacilitator).debitCount()).toBe(0);
+    const row = ctx.settlements.get('mock-final-tx');
+    expect(row?.chain).toBe('near:testnet');
+    expect(row?.from).toBe(SENDER);
+    expect(row?.to).toBe(FOUNDRY);
   });
 });

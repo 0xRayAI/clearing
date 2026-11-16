@@ -227,12 +227,14 @@ export type DiscoveredService = {
 };
 
 export type Transfer = {
-  from: HexAddress;
-  to: HexAddress;
+  from: string;
+  to: string;
   amountUsd: string;
   at: string;
-  txHash: HexAddress;
+  txHash: string;
   tag?: 'soak' | 'external';
+  /** Base rows omit this. NEAR rows are `near:testnet`, never chain 8453. */
+  chain?: 'eip155:8453' | 'near:testnet';
 };
 
 export type FetchFn = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;

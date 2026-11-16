@@ -1,34 +1,44 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { join } from 'node:path';
-import { normalizeAddress } from './bytes.js';
+import { isHexAddress, normalizeAddress } from './bytes.js';
 import type { HexAddress, Transfer } from './types.js';
+
+/** Hex addresses are lowercased. NEAR account ids are stored unchanged. */
+function party(value: string): string {
+  return isHexAddress(value) ? normalizeAddress(value) : value;
+}
 
 export interface SettlementOracle {
   transfersTo(payTo: HexAddress, sinceIso: string): Transfer[];
   add(transfer: Transfer): void;
+  get(txHash: string): Transfer | undefined;
 }
 
 export class MemorySettlementOracle implements SettlementOracle {
   constructor(private readonly rows: Transfer[] = []) {}
 
   has(txHash: string): boolean {
+    return this.get(txHash) !== undefined;
+  }
+
+  get(txHash: string): Transfer | undefined {
     const needle = txHash.toLowerCase();
-    return this.rows.some((row) => row.txHash.toLowerCase() === needle);
+    return this.rows.find((row) => row.txHash.toLowerCase() === needle);
   }
 
   add(transfer: Transfer): void {
     if (this.has(transfer.txHash)) return;
     this.rows.push({
       ...transfer,
-      from: normalizeAddress(transfer.from),
-      to: normalizeAddress(transfer.to),
+      from: party(transfer.from),
+      to: party(transfer.to),
     });
   }
 
   transfersTo(payTo: HexAddress, sinceIso: string): Transfer[] {
-    const to = normalizeAddress(payTo);
-    return this.rows.filter((row) => normalizeAddress(row.to) === to && row.at >= sinceIso);
+    const to = party(payTo);
+    return this.rows.filter((row) => party(row.to) === to && row.at >= sinceIso);
   }
 }
 
@@ -49,8 +59,8 @@ export class FileSettlementOracle extends MemorySettlementOracle {
     if (this.has(transfer.txHash)) return;
     const stored: Transfer = {
       ...transfer,
-      from: normalizeAddress(transfer.from),
-      to: normalizeAddress(transfer.to),
+      from: party(transfer.from),
+      to: party(transfer.to),
     };
     super.add(stored);
     mkdirSync(dirname(this.path), { recursive: true });
@@ -68,8 +78,8 @@ function loadSettlementJsonl(path: string): Transfer[] {
       if (!row?.txHash || !row.to || !row.from) continue;
       byHash.set(row.txHash.toLowerCase(), {
         ...row,
-        from: normalizeAddress(row.from),
-        to: normalizeAddress(row.to),
+        from: party(row.from),
+        to: party(row.to),
       });
     } catch {
       /* skip corrupt line */
