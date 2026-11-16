@@ -1,11 +1,15 @@
+import { randomBytes } from 'node:crypto';
 import {
   appendFileSync,
   closeSync,
   constants,
   existsSync,
+  fstatSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
   statSync,
   unlinkSync,
   writeSync,
@@ -18,6 +22,15 @@ import { parseUsd } from './money.js';
 function staleLockMs(): number {
   const raw = Number(process.env.CLEARING_LEDGER_LOCK_STALE_MS ?? 30_000);
   return Number.isFinite(raw) && raw >= 0 ? raw : 30_000;
+}
+
+/**
+ * A crashed stealer's guard is swept after this. Tests set
+ * CLEARING_LEDGER_STEAL_STALE_MS. A live steal finishes well inside it.
+ */
+function stealGuardStaleMs(): number {
+  const raw = Number(process.env.CLEARING_LEDGER_STEAL_STALE_MS ?? 5_000);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 5_000;
 }
 
 const COUNTED: ReceiptStatus[] = ['submitted', 'settled', 'replayed'];
@@ -82,7 +95,9 @@ export class FileLedger extends MemoryLedger {
 
   /**
    * Append-only. A later line for the same paymentId wins on load.
-   * Exclusive lock is O_CREAT|O_EXCL (open(2)). A stale lock file is removed.
+   * Exclusive lock is O_CREAT|O_EXCL (open(2)). Stealers share one
+   * path.steal guard. Inside it, a lock is renamed only when a fresh
+   * snapshot is still the stale one. Release renames only its own inode.
    */
   override put(receipt: Receipt): void {
     super.put(receipt);
@@ -91,52 +106,264 @@ export class FileLedger extends MemoryLedger {
   }
 
   override withLock<T>(fn: () => T): T {
-    const fd = acquireLock(`${this.path}.lock`);
+    const held = acquireLedgerLock(`${this.path}.lock`);
     try {
       this.replaceAll(loadJsonl(this.path));
       return fn();
     } finally {
-      try {
-        closeSync(fd);
-      } catch {
-        /* already closed */
-      }
-      try {
-        unlinkSync(`${this.path}.lock`);
-      } catch {
-        /* a stale-lock breaker may have removed it */
+      if (releaseLedgerLock(`${this.path}.lock`, held) === 'lost') {
+        throw new Error('ledger lock lost');
       }
     }
   }
 }
 
-function sleepMs(ms: number): void {
-  const view = new Int32Array(new SharedArrayBuffer(4));
-  Atomics.wait(view, 0, 0, ms);
-}
+export type LedgerLock = { fd: number; token: string };
 
-function acquireLock(path: string): number {
+export type LedgerRelease = 'released' | 'lost';
+
+/** Exclusive lock. The file holds `pid:random` so only that owner may remove it. */
+export function acquireLedgerLock(path: string): LedgerLock {
   const started = Date.now();
   for (;;) {
     try {
       const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
-      writeSync(fd, `${process.pid}\n`);
-      return fd;
+      const token = `${process.pid}:${randomBytes(16).toString('hex')}`;
+      writeSync(fd, token);
+      return { fd, token };
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== 'EEXIST') throw err;
-      try {
-        const age = Date.now() - statSync(path).mtimeMs;
-        if (age > staleLockMs()) unlinkSync(path);
-      } catch {
-        /* the holder removed it between stat and unlink */
-      }
+      if (stealStaleLock(path)) continue;
       if (Date.now() - started > staleLockMs() + 5_000) {
         throw new Error(`ledger lock timeout: ${path}`);
       }
       sleepMs(15);
     }
   }
+}
+
+/**
+ * Drop our lock. Design (a): the same path.steal guard serializes this with
+ * stealers, so path is renamed only while its inode is still ours. A mismatch
+ * means the lock was already taken; that is reported as lost and nothing is
+ * put back. A restore is never attempted, so path is not empty for a live holder.
+ */
+export function releaseLedgerLock(path: string, held: LedgerLock): LedgerRelease {
+  let result: LedgerRelease = 'lost';
+  try {
+    result = withStealGuard(path, (guard) => releaseOwnedLock(path, held, guard));
+  } finally {
+    try {
+      closeSync(held.fd);
+    } catch {
+      /* already closed */
+    }
+  }
+  return result;
+}
+
+function lockSnapshot(path: string): { token: string; mtimeMs: number } | undefined {
+  try {
+    return { token: readFileSync(path, 'utf8'), mtimeMs: statSync(path).mtimeMs };
+  } catch {
+    return undefined;
+  }
+}
+
+function errorCode(err: unknown): string | undefined {
+  return (err as NodeJS.ErrnoException).code;
+}
+
+function isStale(mtimeMs: number): boolean {
+  return Date.now() - mtimeMs > staleLockMs();
+}
+
+/**
+ * Design (a). Stealers and releasers take path.steal with O_EXCL before they
+ * look again. Inside that guard the snapshot is repeated. The lock is renamed
+ * only when the token and mtime still match that stale snapshot, so a second
+ * stealer cannot rename a fresh lock. A rename that misses that token is put
+ * back only when path is free, and the steal returns false. Grave names
+ * carry the token plus a random suffix. Leftover graves are ignored. A steal
+ * guard older than its own timeout is renamed aside and deleted only when
+ * that renamed file is still stale, so a crash cannot block the next acquire.
+ */
+function stealStaleLock(path: string): boolean {
+  const seen = lockSnapshot(path);
+  if (!seen || !isStale(seen.mtimeMs)) return false;
+  return withStealGuard(path, (guard) => {
+    // A test can park a live stealer here, past the guard TTL, before rename.
+    pauseStealIfRequested();
+    if (!guardStillOurs(path, guard)) return false;
+    const again = lockSnapshot(path);
+    if (!again || again.token !== seen.token || again.mtimeMs !== seen.mtimeMs) return false;
+    if (!isStale(again.mtimeMs)) return false;
+    if (!guardStillOurs(path, guard)) return false;
+    const grave = `${path}.stale.${seen.token}.${randomBytes(8).toString('hex')}`;
+    try {
+      renameSync(path, grave);
+    } catch (err) {
+      if (errorCode(err) === 'ENOENT') return false;
+      throw err;
+    }
+    const moved = lockSnapshot(grave);
+    if (moved && moved.token === seen.token && isStale(moved.mtimeMs)) {
+      try {
+        unlinkSync(grave);
+      } catch {
+        /* already gone */
+      }
+      return true;
+    }
+    restoreRenamedIfFree(grave, path);
+    return false;
+  });
+}
+
+/** Block between taking the steal guard and renaming. Tests set this to a fifo. */
+function pauseStealIfRequested(): void {
+  const fifo = process.env.CLEARING_LEDGER_STEAL_HOLD;
+  if (!fifo) return;
+  readFileSync(fifo);
+}
+
+function guardStillOurs(lockPath: string, guard: LedgerLock): boolean {
+  try {
+    return statSync(`${lockPath}.steal`).ino === fstatSync(guard.fd).ino;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A rename that did not pick up the stale snapshot is not a steal.
+ * linkSync is O_EXCL: it fails with EEXIST when path is already held.
+ * In that case the renamed file stays at its unique grave and the steal
+ * returns false. The file is put back only when path is still free.
+ */
+function restoreRenamedIfFree(grave: string, path: string): void {
+  try {
+    linkSync(grave, path);
+  } catch (err) {
+    if (errorCode(err) === 'EEXIST') return;
+    throw err;
+  }
+  try {
+    unlinkSync(grave);
+  } catch {
+    /* already gone */
+  }
+}
+
+function releaseOwnedLock(path: string, held: LedgerLock, guard: LedgerLock): LedgerRelease {
+  if (!guardStillOurs(path, guard)) return 'lost';
+  let currentIno: number;
+  try {
+    currentIno = statSync(path).ino;
+  } catch {
+    return 'lost';
+  }
+  if (currentIno !== fstatSync(held.fd).ino) return 'lost';
+  const grave = `${path}.rel.${held.token}.${randomBytes(8).toString('hex')}`;
+  try {
+    renameSync(path, grave);
+  } catch (err) {
+    if (errorCode(err) === 'ENOENT') return 'lost';
+    throw err;
+  }
+  const moved = lockSnapshot(grave);
+  if (moved?.token === held.token) {
+    try {
+      unlinkSync(grave);
+    } catch {
+      /* already gone */
+    }
+    return 'released';
+  }
+  return 'lost';
+}
+
+function withStealGuard<T>(lockPath: string, fn: (guard: LedgerLock) => T): T {
+  const held = acquireStealGuard(lockPath);
+  try {
+    return fn(held);
+  } finally {
+    releaseStealGuard(`${lockPath}.steal`, held);
+  }
+}
+
+function acquireStealGuard(lockPath: string): LedgerLock {
+  const guard = `${lockPath}.steal`;
+  const started = Date.now();
+  for (;;) {
+    try {
+      const fd = openSync(guard, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
+      const token = `${process.pid}:${randomBytes(8).toString('hex')}`;
+      writeSync(fd, token);
+      return { fd, token };
+    } catch (err) {
+      if (errorCode(err) !== 'EEXIST') throw err;
+      if (sweepStaleGuard(guard)) continue;
+      if (Date.now() - started > staleLockMs() + stealGuardStaleMs() + 5_000) {
+        throw new Error(`ledger steal guard timeout: ${guard}`);
+      }
+      sleepMs(15);
+    }
+  }
+}
+
+function releaseStealGuard(guard: string, held: LedgerLock): void {
+  try {
+    const current = statSync(guard);
+    if (current.ino === fstatSync(held.fd).ino) {
+      const grave = `${guard}.rel.${held.token}.${randomBytes(8).toString('hex')}`;
+      renameSync(guard, grave);
+      const moved = lockSnapshot(grave);
+      if (moved?.token === held.token) {
+        try {
+          unlinkSync(grave);
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+  } catch {
+    /* a sweep already moved a crashed guard */
+  } finally {
+    try {
+      closeSync(held.fd);
+    } catch {
+      /* already closed */
+    }
+  }
+}
+
+function sweepStaleGuard(guard: string): boolean {
+  const seen = lockSnapshot(guard);
+  if (!seen || Date.now() - seen.mtimeMs <= stealGuardStaleMs()) return false;
+  const grave = `${guard}.old.${randomBytes(8).toString('hex')}`;
+  try {
+    renameSync(guard, grave);
+  } catch (err) {
+    if (errorCode(err) === 'ENOENT') return false;
+    throw err;
+  }
+  const moved = lockSnapshot(grave);
+  if (moved && Date.now() - moved.mtimeMs > stealGuardStaleMs()) {
+    try {
+      unlinkSync(grave);
+    } catch {
+      /* already gone */
+    }
+    return true;
+  }
+  return false;
+}
+
+function sleepMs(ms: number): void {
+  const view = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(view, 0, 0, ms);
 }
 
 function loadJsonl(path: string): Receipt[] {
