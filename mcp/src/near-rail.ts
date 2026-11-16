@@ -97,11 +97,14 @@ export function nearQuotePaymentId(nonce: string): string {
   return `${QUOTE_PREFIX}${nonce}`;
 }
 
-function nearTxPaymentId(txHash: string): string {
+export function nearTxPaymentId(txHash: string): string {
   return `${TX_PREFIX}${txHash}`;
 }
 
-type QuoteBody = StoredNearQuote & { chain: 'near:testnet' };
+type QuoteBody = StoredNearQuote & { chain: 'near:testnet'; txHash?: string };
+
+/** A submitted claim older than this is recovered or reclaimed. */
+export const DEFAULT_STALE_SUBMIT_MS = 60_000;
 
 function nearRow(paymentId: string, status: Receipt['status'], body: unknown, nowMs: number): Receipt {
   const at = new Date(nowMs).toISOString();
@@ -129,7 +132,14 @@ function quoteBody(row: Receipt | undefined): QuoteBody | undefined {
     return undefined;
   }
   if (typeof rec.expiresAt !== 'number') return undefined;
-  return { receiver: rec.receiver, amount: rec.amount, nonce: rec.nonce, expiresAt: rec.expiresAt, chain: 'near:testnet' };
+  return {
+    receiver: rec.receiver,
+    amount: rec.amount,
+    nonce: rec.nonce,
+    expiresAt: rec.expiresAt,
+    chain: 'near:testnet',
+    txHash: typeof rec.txHash === 'string' ? rec.txHash : undefined,
+  };
 }
 
 /**
@@ -149,19 +159,53 @@ export function issueNearQuote(ledger: Ledger, input: IssueInput): StoredNearQuo
   return quote;
 }
 
-type Claim = { ok: true; quote: QuoteBody } | { ok: false; code: VerifyCode };
+type Claim =
+  | { ok: true; quote: QuoteBody; recover?: false }
+  | { ok: true; quote: QuoteBody; recover: true; txHash: string }
+  | { ok: false; code: VerifyCode };
 
-/** Synchronous. Runs before any RPC await so two callers cannot both pass. */
-function claimNonce(ledger: Ledger, nonce: string, nowMs: number): Claim {
+function ageMs(updatedAt: string, nowMs: number): number {
+  return nowMs - Date.parse(updatedAt);
+}
+
+/**
+ * Synchronous. The caller holds ledger.withLock, which re-reads the file first.
+ * A fresh `submitted` row is a replay. A stale one with a tx hash is finished
+ * from chain; a stale one with no tx hash is claimed again.
+ */
+function claimNonce(ledger: Ledger, nonce: string, nowMs: number, staleSubmitMs: number): Claim {
   const row = ledger.get(nearQuotePaymentId(nonce));
   if (!row) return { ok: false, code: 'missing_nonce' };
-  if (row.status === 'settled' || row.status === 'submitted') return { ok: false, code: 'replayed_nonce' };
-  if (row.status !== 'quoted') return { ok: false, code: 'missing_nonce' };
   const quote = quoteBody(row);
   if (!quote) return { ok: false, code: 'missing_nonce' };
+  if (row.status === 'settled') return { ok: false, code: 'replayed_nonce' };
+  if (row.status === 'submitted') {
+    if (ageMs(row.updatedAt, nowMs) <= staleSubmitMs) return { ok: false, code: 'replayed_nonce' };
+    const at = new Date(nowMs).toISOString();
+    if (quote.txHash) {
+      ledger.put({ ...row, status: 'submitted', updatedAt: at });
+      return { ok: true, quote, recover: true, txHash: quote.txHash };
+    }
+    if (nowMs > quote.expiresAt) return { ok: false, code: 'nonce_past_ttl' };
+    ledger.put({ ...row, status: 'submitted', updatedAt: at });
+    return { ok: true, quote };
+  }
+  if (row.status !== 'quoted') return { ok: false, code: 'missing_nonce' };
   if (nowMs > quote.expiresAt) return { ok: false, code: 'nonce_past_ttl' };
   ledger.put({ ...row, status: 'submitted', updatedAt: new Date(nowMs).toISOString() });
   return { ok: true, quote };
+}
+
+function stampTx(ledger: Ledger, nonce: string, txHash: string, nowMs: number): void {
+  const row = ledger.get(nearQuotePaymentId(nonce));
+  const quote = quoteBody(row);
+  if (!row || !quote) return;
+  ledger.put({
+    ...row,
+    status: 'submitted',
+    body: { ...quote, txHash },
+    updatedAt: new Date(nowMs).toISOString(),
+  });
 }
 
 function claimTx(ledger: Ledger, txHash: string, nowMs: number): boolean {
@@ -189,12 +233,15 @@ function releaseTx(ledger: Ledger, txHash: string, nowMs: number): void {
   ledger.put({ ...row, status: 'failed', updatedAt: new Date(nowMs).toISOString() });
 }
 
-function commitClaim(ledger: Ledger, nonce: string, txHash: string, nowMs: number): void {
-  const at = new Date(nowMs).toISOString();
+function commitClaim(ledger: Ledger, nonce: string, txHash: string, nowMs: number): boolean {
   const quote = ledger.get(nearQuotePaymentId(nonce));
   const tx = ledger.get(nearTxPaymentId(txHash));
-  if (quote) ledger.put({ ...quote, status: 'settled', updatedAt: at });
-  if (tx) ledger.put({ ...tx, status: 'settled', updatedAt: at });
+  if (!quote || quote.status !== 'submitted') return false;
+  if (!tx || tx.status !== 'submitted') return false;
+  const at = new Date(nowMs).toISOString();
+  ledger.put({ ...quote, status: 'settled', updatedAt: at });
+  ledger.put({ ...tx, status: 'settled', updatedAt: at });
+  return true;
 }
 
 export function nearAccept(args: {
@@ -257,32 +304,49 @@ export async function verifyPayment(args: {
   nonce: string;
   nowMs: number;
   readReceipt: NearReceiptReader;
+  /** How long a `submitted` row stays exclusive before crash recovery. */
+  staleSubmitMs?: number;
 }): Promise<VerifyResult> {
-  const claimed = claimNonce(args.ledger, args.nonce, args.nowMs);
+  const staleSubmitMs = args.staleSubmitMs ?? DEFAULT_STALE_SUBMIT_MS;
+  const claimed = args.ledger.withLock(() => {
+    const nonceClaim = claimNonce(args.ledger, args.nonce, args.nowMs, staleSubmitMs);
+    if (!nonceClaim.ok) return nonceClaim;
+    if (nonceClaim.recover) return nonceClaim;
+    if (!claimTx(args.ledger, args.txHash, args.nowMs)) {
+      releaseNonce(args.ledger, args.nonce, args.nowMs);
+      return { ok: false as const, code: 'replayed_tx' as const };
+    }
+    stampTx(args.ledger, args.nonce, args.txHash, args.nowMs);
+    return nonceClaim;
+  });
   if (!claimed.ok) return { ok: false, code: claimed.code };
-  if (!claimTx(args.ledger, args.txHash, args.nowMs)) {
-    releaseNonce(args.ledger, args.nonce, args.nowMs);
-    return { ok: false, code: 'replayed_tx' };
-  }
 
+  const txHash = claimed.recover ? claimed.txHash : args.txHash;
   const release = () => {
-    releaseNonce(args.ledger, args.nonce, args.nowMs);
-    releaseTx(args.ledger, args.txHash, args.nowMs);
+    args.ledger.withLock(() => {
+      releaseNonce(args.ledger, args.nonce, args.nowMs);
+      releaseTx(args.ledger, txHash, args.nowMs);
+    });
   };
   let view: NearTransferView;
   try {
-    view = await args.readReceipt(args.txHash, args.senderAccountId);
+    view = await args.readReceipt(txHash, args.senderAccountId);
   } catch {
     release();
     return { ok: false, code: 'not_final' };
   }
-  const failed = checkView(view, claimed.quote, args.senderAccountId, args.nonce);
-  if (failed) {
-    release();
-    return { ok: false, code: failed };
-  }
-  commitClaim(args.ledger, args.nonce, args.txHash, args.nowMs);
-  return { ok: true, txHash: args.txHash, senderAccountId: args.senderAccountId, amount: claimed.quote.amount };
+  return args.ledger.withLock(() => {
+    const failed = checkView(view, claimed.quote, args.senderAccountId, args.nonce);
+    if (failed) {
+      releaseNonce(args.ledger, args.nonce, args.nowMs);
+      releaseTx(args.ledger, txHash, args.nowMs);
+      return { ok: false, code: failed };
+    }
+    if (!commitClaim(args.ledger, args.nonce, txHash, args.nowMs)) {
+      return { ok: false, code: 'replayed_nonce' };
+    }
+    return { ok: true, txHash, senderAccountId: args.senderAccountId, amount: claimed.quote.amount };
+  });
 }
 
 function checkView(

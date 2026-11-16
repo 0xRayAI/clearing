@@ -1,6 +1,9 @@
-import { mkdtempSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { handleBlip } from '../mcp/src/blip.js';
 import { MemoryFacilitator } from '../mcp/src/facilitator.js';
@@ -11,6 +14,7 @@ import {
   issueNearQuote,
   NEAR_QUOTE_TTL_MS,
   nearQuotePaymentId,
+  nearTxPaymentId,
   transferFromTxStatus,
   verifyPayment,
   type NearTransferView,
@@ -276,6 +280,117 @@ describe('NEAR USDC rail', () => {
       check(ledger, right.nonce, 'tx-same', view({ memo: right.nonce }), 4),
     ]);
     expect([sameA, sameB].filter((row) => row.ok)).toHaveLength(1);
+  });
+
+  it('a stale submitted row with a tx hash is settled from that receipt', async () => {
+    const quote = issue(ledger);
+    const row = ledger.get(nearQuotePaymentId(quote.nonce));
+    expect(row).toBeDefined();
+    const crashedAt = new Date(0).toISOString();
+    ledger.put({
+      ...row!,
+      status: 'submitted',
+      updatedAt: crashedAt,
+      body: { ...(row!.body as object), txHash: 'crashed-tx' },
+    });
+    ledger.put({
+      ...row!,
+      paymentId: nearTxPaymentId('crashed-tx'),
+      status: 'submitted',
+      updatedAt: crashedAt,
+      body: { txHash: 'crashed-tx', chain: 'near:testnet' },
+    });
+    let readHash = '';
+    const result = await verifyPayment({
+      ledger,
+      txHash: 'ignored-by-recovery',
+      senderAccountId: SENDER,
+      nonce: quote.nonce,
+      nowMs: 120_000,
+      staleSubmitMs: 1_000,
+      readReceipt: async (txHash) => {
+        readHash = txHash;
+        return view({ memo: quote.nonce });
+      },
+    });
+    expect(readHash).toBe('crashed-tx');
+    expect(result).toMatchObject({ ok: true, txHash: 'crashed-tx', amount: AMOUNT });
+    expect(ledger.get(nearQuotePaymentId(quote.nonce))?.status).toBe('settled');
+    expect(ledger.get(nearTxPaymentId('crashed-tx'))?.status).toBe('settled');
+  });
+
+  it('a stale submitted row with no tx hash can be claimed again', async () => {
+    const quote = issue(ledger);
+    const row = ledger.get(nearQuotePaymentId(quote.nonce));
+    ledger.put({ ...row!, status: 'submitted', updatedAt: new Date(0).toISOString() });
+    const result = await verifyPayment({
+      ledger,
+      txHash: 'retry-tx',
+      senderAccountId: SENDER,
+      nonce: quote.nonce,
+      nowMs: 5_000,
+      staleSubmitMs: 1_000,
+      readReceipt: reader(view({ memo: quote.nonce })),
+    });
+    expect(result).toMatchObject({ ok: true, txHash: 'retry-tx' });
+  });
+
+  it('a fresh submitted row is still replayed_nonce', async () => {
+    const quote = issue(ledger);
+    const row = ledger.get(nearQuotePaymentId(quote.nonce));
+    ledger.put({ ...row!, status: 'submitted', updatedAt: new Date(1).toISOString() });
+    const result = await verifyPayment({
+      ledger,
+      txHash: 'tx-fresh',
+      senderAccountId: SENDER,
+      nonce: quote.nonce,
+      nowMs: 2,
+      staleSubmitMs: 60_000,
+      readReceipt: reader(view({ memo: quote.nonce })),
+    });
+    expect(result).toEqual({ ok: false, code: 'replayed_nonce' });
+  });
+
+  it('two processes racing one file produce one claim', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'near-rail-race-'));
+    const path = ledgerPath(dir);
+    const first = new FileLedger(path);
+    const nowMs = Date.now();
+    const quote = issueNearQuote(first, { receiver: FOUNDRY, amount: AMOUNT, nowMs });
+    const worker = fileURLToPath(new URL('./near-claim-worker.ts', import.meta.url));
+    const tsx = createRequire(import.meta.url).resolve('tsx/cli');
+    const run = (txHash: string) =>
+      new Promise<string>((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [tsx, worker, path, quote.nonce, txHash, SENDER, FOUNDRY, AMOUNT, String(nowMs)],
+          { cwd: dirname(worker) },
+        );
+        let out = '';
+        let err = '';
+        child.stdout.on('data', (chunk: Buffer) => {
+          out += chunk.toString();
+        });
+        child.stderr.on('data', (chunk: Buffer) => {
+          err += chunk.toString();
+        });
+        child.on('error', reject);
+        child.on('close', (code) => {
+          if (code !== 0) {
+            reject(new Error(`worker ${code}: ${err}`));
+            return;
+          }
+          resolve(out.trim());
+        });
+      });
+    const [left, right] = await Promise.all([run('tx-proc-a'), run('tx-proc-b')]);
+    const results = [JSON.parse(left), JSON.parse(right)] as Array<{ ok: boolean }>;
+    expect(results.filter((row) => row.ok)).toHaveLength(1);
+    const settled = new FileLedger(path);
+    expect(settled.get(nearQuotePaymentId(quote.nonce))?.status).toBe('settled');
+    const lines = readFileSync(path, 'utf8').trim().split('\n');
+    const quoteLines = lines.filter((line) => line.includes(quote.nonce));
+    expect(quoteLines.length).toBeGreaterThan(1);
   });
 
   it('a second ledger opened on the same file sees the quote', () => {
