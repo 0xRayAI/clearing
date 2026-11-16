@@ -1,5 +1,5 @@
-import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { closeSync, constants, existsSync, mkdtempSync, openSync, readFileSync, renameSync, unlinkSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -134,6 +134,60 @@ describe('file ledger', () => {
       else process.env.CLEARING_LEDGER_STEAL_STALE_MS = previousGuard;
     }
   });
+
+  it('withLock throws when the release is lost', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clearing-ledger-lost-'));
+    const path = ledgerPath(dir);
+    const ledger = new FileLedger(path);
+    const lock = `${path}.lock`;
+    expect(() => {
+      ledger.withLock(() => {
+        renameSync(lock, `${lock}.moved`);
+        unlinkSync(`${lock}.moved`);
+        const fd = openSync(lock, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
+        writeSync(fd, 'other-holder');
+        closeSync(fd);
+      });
+    }).toThrow(/ledger lock lost/);
+  });
+
+  it('a stealer paused past the guard ttl does not move the fresh lock', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clearing-ledger-pause-'));
+    const lock = join(dir, 'receipts.jsonl.lock');
+    const log = join(dir, 'holders.log');
+    const fifo = join(dir, 'hold.fifo');
+    execFileSync('mkfifo', [fifo]);
+    const previousLock = process.env.CLEARING_LEDGER_LOCK_STALE_MS;
+    const previousGuard = process.env.CLEARING_LEDGER_STEAL_STALE_MS;
+    process.env.CLEARING_LEDGER_LOCK_STALE_MS = '1000';
+    process.env.CLEARING_LEDGER_STEAL_STALE_MS = '400';
+    try {
+      writeFileSync(lock, `0:${'ab'.repeat(16)}`);
+      const past = new Date(Date.now() - 5_000);
+      utimesSync(lock, past, past);
+      const child = enterLock(lock, log, fifo);
+      const started = Date.now();
+      while (!existsSync(`${lock}.steal`)) {
+        if (Date.now() - started > 5_000) throw new Error('stealer did not take the guard');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const held = acquireLedgerLock(lock);
+      expect(readFileSync(lock, 'utf8')).toBe(held.token);
+      writeFileSync(fifo, 'go\n');
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(readFileSync(lock, 'utf8')).toBe(held.token);
+      expect(existsSync(log)).toBe(false);
+      expect(releaseLedgerLock(lock, held)).toBe('released');
+      await child;
+      expect(holderDepth(readFileSync(log, 'utf8'))).toEqual({ max: 1, enters: 1, open: 0 });
+    } finally {
+      if (previousLock === undefined) delete process.env.CLEARING_LEDGER_LOCK_STALE_MS;
+      else process.env.CLEARING_LEDGER_LOCK_STALE_MS = previousLock;
+      if (previousGuard === undefined) delete process.env.CLEARING_LEDGER_STEAL_STALE_MS;
+      else process.env.CLEARING_LEDGER_STEAL_STALE_MS = previousGuard;
+    }
+  });
 });
 
 function holderDepth(log: string): { max: number; enters: number; open: number } {
@@ -152,13 +206,15 @@ function holderDepth(log: string): { max: number; enters: number; open: number }
   return { max, enters, open };
 }
 
-function enterLock(lock: string, log: string): Promise<void> {
+function enterLock(lock: string, log: string, holdFifo?: string): Promise<void> {
   const worker = fileURLToPath(new URL('./ledger-lock-worker.ts', import.meta.url));
   const tsx = createRequire(import.meta.url).resolve('tsx/cli');
+  const args = [tsx, worker, lock, log];
+  if (holdFifo) args.push(holdFifo);
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [tsx, worker, lock, log], {
+    const child = spawn(process.execPath, args, {
       cwd: dirname(worker),
-      env: { ...process.env, CLEARING_LEDGER_LOCK_STALE_MS: '1000' },
+      env: { ...process.env, CLEARING_LEDGER_LOCK_STALE_MS: process.env.CLEARING_LEDGER_LOCK_STALE_MS ?? '1000' },
     });
     let err = '';
     child.stderr.on('data', (chunk: Buffer) => {

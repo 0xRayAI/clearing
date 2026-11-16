@@ -5,7 +5,8 @@
 import { appendFileSync } from 'node:fs';
 import { acquireLedgerLock, releaseLedgerLock } from '../mcp/src/ledger.js';
 
-const [lockPath, logPath] = process.argv.slice(2);
+const [lockPath, logPath, holdFifo] = process.argv.slice(2);
+if (holdFifo) process.env.CLEARING_LEDGER_STEAL_HOLD = holdFifo;
 const held = acquireLedgerLock(lockPath);
 appendFileSync(logPath, `enter ${process.pid}\n`);
 await new Promise((resolve) => setTimeout(resolve, 40));

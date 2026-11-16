@@ -5,6 +5,7 @@ import {
   constants,
   existsSync,
   fstatSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -110,7 +111,9 @@ export class FileLedger extends MemoryLedger {
       this.replaceAll(loadJsonl(this.path));
       return fn();
     } finally {
-      releaseLedgerLock(`${this.path}.lock`, held);
+      if (releaseLedgerLock(`${this.path}.lock`, held) === 'lost') {
+        throw new Error('ledger lock lost');
+      }
     }
   }
 }
@@ -149,7 +152,7 @@ export function acquireLedgerLock(path: string): LedgerLock {
 export function releaseLedgerLock(path: string, held: LedgerLock): LedgerRelease {
   let result: LedgerRelease = 'lost';
   try {
-    result = withStealGuard(path, () => releaseOwnedLock(path, held));
+    result = withStealGuard(path, (guard) => releaseOwnedLock(path, held, guard));
   } finally {
     try {
       closeSync(held.fd);
@@ -180,7 +183,8 @@ function isStale(mtimeMs: number): boolean {
  * Design (a). Stealers and releasers take path.steal with O_EXCL before they
  * look again. Inside that guard the snapshot is repeated. The lock is renamed
  * only when the token and mtime still match that stale snapshot, so a second
- * stealer cannot rename a fresh lock and no restore is required. Grave names
+ * stealer cannot rename a fresh lock. A rename that misses that token is put
+ * back only when path is free, and the steal returns false. Grave names
  * carry the token plus a random suffix. Leftover graves are ignored. A steal
  * guard older than its own timeout is renamed aside and deleted only when
  * that renamed file is still stale, so a crash cannot block the next acquire.
@@ -188,11 +192,15 @@ function isStale(mtimeMs: number): boolean {
 function stealStaleLock(path: string): boolean {
   const seen = lockSnapshot(path);
   if (!seen || !isStale(seen.mtimeMs)) return false;
-  return withStealGuard(path, () => {
+  return withStealGuard(path, (guard) => {
+    // A test can park a live stealer here, past the guard TTL, before rename.
+    pauseStealIfRequested();
+    if (!guardStillOurs(path, guard)) return false;
     const again = lockSnapshot(path);
     if (!again || again.token !== seen.token || again.mtimeMs !== seen.mtimeMs) return false;
     if (!isStale(again.mtimeMs)) return false;
-    const grave = `${path}.stale.${again.token}.${randomBytes(8).toString('hex')}`;
+    if (!guardStillOurs(path, guard)) return false;
+    const grave = `${path}.stale.${seen.token}.${randomBytes(8).toString('hex')}`;
     try {
       renameSync(path, grave);
     } catch (err) {
@@ -200,18 +208,56 @@ function stealStaleLock(path: string): boolean {
       throw err;
     }
     const moved = lockSnapshot(grave);
-    if (moved && moved.token === again.token && isStale(moved.mtimeMs)) {
+    if (moved && moved.token === seen.token && isStale(moved.mtimeMs)) {
       try {
         unlinkSync(grave);
       } catch {
         /* already gone */
       }
+      return true;
     }
-    return true;
+    restoreRenamedIfFree(grave, path);
+    return false;
   });
 }
 
-function releaseOwnedLock(path: string, held: LedgerLock): LedgerRelease {
+/** Block between taking the steal guard and renaming. Tests set this to a fifo. */
+function pauseStealIfRequested(): void {
+  const fifo = process.env.CLEARING_LEDGER_STEAL_HOLD;
+  if (!fifo) return;
+  readFileSync(fifo);
+}
+
+function guardStillOurs(lockPath: string, guard: LedgerLock): boolean {
+  try {
+    return statSync(`${lockPath}.steal`).ino === fstatSync(guard.fd).ino;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A rename that did not pick up the stale snapshot is not a steal.
+ * linkSync is O_EXCL: it fails with EEXIST when path is already held.
+ * In that case the renamed file stays at its unique grave and the steal
+ * returns false. The file is put back only when path is still free.
+ */
+function restoreRenamedIfFree(grave: string, path: string): void {
+  try {
+    linkSync(grave, path);
+  } catch (err) {
+    if (errorCode(err) === 'EEXIST') return;
+    throw err;
+  }
+  try {
+    unlinkSync(grave);
+  } catch {
+    /* already gone */
+  }
+}
+
+function releaseOwnedLock(path: string, held: LedgerLock, guard: LedgerLock): LedgerRelease {
+  if (!guardStillOurs(path, guard)) return 'lost';
   let currentIno: number;
   try {
     currentIno = statSync(path).ino;
@@ -238,10 +284,10 @@ function releaseOwnedLock(path: string, held: LedgerLock): LedgerRelease {
   return 'lost';
 }
 
-function withStealGuard<T>(lockPath: string, fn: () => T): T {
+function withStealGuard<T>(lockPath: string, fn: (guard: LedgerLock) => T): T {
   const held = acquireStealGuard(lockPath);
   try {
-    return fn();
+    return fn(held);
   } finally {
     releaseStealGuard(`${lockPath}.steal`, held);
   }
