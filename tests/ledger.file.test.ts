@@ -1,8 +1,8 @@
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { FileLedger, ledgerPath } from '../mcp/src/ledger.js';
+import { acquireLedgerLock, FileLedger, ledgerPath, releaseLedgerLock } from '../mcp/src/ledger.js';
 import type { Receipt } from '../mcp/src/types.js';
 
 describe('file ledger', () => {
@@ -28,5 +28,26 @@ describe('file ledger', () => {
     const b = new FileLedger(path);
     expect(b.get(row.paymentId)?.status).toBe('settled');
     expect(b.spentUsd({ sessionId: 'sess' })).toBe(0.02);
+  });
+
+  it('a release after a stale takeover leaves the new owner lock', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clearing-ledger-lock-'));
+    const lock = join(dir, 'receipts.jsonl.lock');
+    const previous = process.env.CLEARING_LEDGER_LOCK_STALE_MS;
+    process.env.CLEARING_LEDGER_LOCK_STALE_MS = '1000';
+    try {
+      const first = acquireLedgerLock(lock);
+      const past = new Date(Date.now() - 5_000);
+      utimesSync(lock, past, past);
+      const second = acquireLedgerLock(lock);
+      releaseLedgerLock(lock, first);
+      expect(existsSync(lock)).toBe(true);
+      expect(readFileSync(lock, 'utf8')).toBe(second.token);
+      releaseLedgerLock(lock, second);
+      expect(existsSync(lock)).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.CLEARING_LEDGER_LOCK_STALE_MS;
+      else process.env.CLEARING_LEDGER_LOCK_STALE_MS = previous;
+    }
   });
 });

@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import {
   appendFileSync,
   closeSync,
@@ -82,7 +83,9 @@ export class FileLedger extends MemoryLedger {
 
   /**
    * Append-only. A later line for the same paymentId wins on load.
-   * Exclusive lock is O_CREAT|O_EXCL (open(2)). A stale lock file is removed.
+   * Exclusive lock is O_CREAT|O_EXCL (open(2)). Release unlinks only the
+   * owner token written at create. A stale lock is removed only when a
+   * second read still shows that same token and mtime.
    */
   override put(receipt: Receipt): void {
     super.put(receipt);
@@ -91,52 +94,83 @@ export class FileLedger extends MemoryLedger {
   }
 
   override withLock<T>(fn: () => T): T {
-    const fd = acquireLock(`${this.path}.lock`);
+    const held = acquireLedgerLock(`${this.path}.lock`);
     try {
       this.replaceAll(loadJsonl(this.path));
       return fn();
     } finally {
-      try {
-        closeSync(fd);
-      } catch {
-        /* already closed */
-      }
-      try {
-        unlinkSync(`${this.path}.lock`);
-      } catch {
-        /* a stale-lock breaker may have removed it */
-      }
+      releaseLedgerLock(`${this.path}.lock`, held);
     }
   }
 }
 
-function sleepMs(ms: number): void {
-  const view = new Int32Array(new SharedArrayBuffer(4));
-  Atomics.wait(view, 0, 0, ms);
-}
+export type LedgerLock = { fd: number; token: string };
 
-function acquireLock(path: string): number {
+/** Exclusive lock. The file holds `pid:random` so only that owner may remove it. */
+export function acquireLedgerLock(path: string): LedgerLock {
   const started = Date.now();
   for (;;) {
     try {
       const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
-      writeSync(fd, `${process.pid}\n`);
-      return fd;
+      const token = `${process.pid}:${randomBytes(16).toString('hex')}`;
+      writeSync(fd, token);
+      return { fd, token };
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== 'EEXIST') throw err;
-      try {
-        const age = Date.now() - statSync(path).mtimeMs;
-        if (age > staleLockMs()) unlinkSync(path);
-      } catch {
-        /* the holder removed it between stat and unlink */
-      }
+      if (stealStaleLock(path)) continue;
       if (Date.now() - started > staleLockMs() + 5_000) {
         throw new Error(`ledger lock timeout: ${path}`);
       }
       sleepMs(15);
     }
   }
+}
+
+/** Unlink only when the file still contains the token this holder wrote. */
+export function releaseLedgerLock(path: string, held: LedgerLock): void {
+  try {
+    closeSync(held.fd);
+  } catch {
+    /* already closed */
+  }
+  try {
+    if (readFileSync(path, 'utf8') !== held.token) return;
+    unlinkSync(path);
+  } catch {
+    /* the file is already gone */
+  }
+}
+
+function lockSnapshot(path: string): { token: string; mtimeMs: number } | undefined {
+  try {
+    return { token: readFileSync(path, 'utf8'), mtimeMs: statSync(path).mtimeMs };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Remove a lock older than the stale window. A second read of the token and
+ * mtime must still match, so a lock a new owner just created is left in place.
+ */
+function stealStaleLock(path: string): boolean {
+  const seen = lockSnapshot(path);
+  if (!seen || Date.now() - seen.mtimeMs <= staleLockMs()) return false;
+  const again = lockSnapshot(path);
+  if (!again || again.token !== seen.token || again.mtimeMs !== seen.mtimeMs) return false;
+  if (Date.now() - again.mtimeMs <= staleLockMs()) return false;
+  try {
+    unlinkSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sleepMs(ms: number): void {
+  const view = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(view, 0, 0, ms);
 }
 
 function loadJsonl(path: string): Receipt[] {
