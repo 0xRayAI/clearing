@@ -21,3 +21,18 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npx tsc --noEmit
+
+  escrow:
+    name: escrow (cargo)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: near/escrow
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: cargo test --locked
+      - run: cargo build --locked --release --target wasm32-unknown-unknown
+      - run: ls -l target/wasm32-unknown-unknown/release/*.wasm
