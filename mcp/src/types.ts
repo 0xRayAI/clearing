@@ -46,6 +46,11 @@ export type ClearingConfig = {
   listedSeed: ListedSeed[];
   /** Deployed Blips ERC-721 on Base (optional until Blaze deploys). */
   blipsNft?: HexAddress;
+  /**
+   * Foundry NEAR account that receives USDC. When set, blip advertises a second
+   * `near:testnet` accept. Unset keeps the Base-only 402.
+   */
+  nearPayTo?: string;
 };
 
 export type ListedSeed = {
@@ -84,6 +89,21 @@ export type PaymentRequirements = {
   mimeType: 'application/json';
   maxTimeoutSeconds: number;
   extra: PaymentExtra;
+};
+
+/** Second 402 accept. Not an EIP-3009 requirement. No plain-NEAR entry. */
+export type NearRailAccept = {
+  scheme: 'exact';
+  network: 'near:testnet';
+  maxAmountRequired: string;
+  amount: string;
+  asset: string;
+  payTo: string;
+  resource: string;
+  description: string;
+  mimeType: 'application/json';
+  maxTimeoutSeconds: number;
+  extra: { method: 'ft_transfer'; memo: string };
 };
 
 export type PaymentExtra = {
@@ -130,7 +150,7 @@ export type X402Quote = {
     serviceName: string;
     tags?: string[];
   };
-  accepts: Array<PaymentRequirements & { amount: string }>;
+  accepts: Array<(PaymentRequirements & { amount: string }) | NearRailAccept>;
   extensions: { bazaar: BazaarExtension };
 };
 
@@ -207,12 +227,14 @@ export type DiscoveredService = {
 };
 
 export type Transfer = {
-  from: HexAddress;
-  to: HexAddress;
+  from: string;
+  to: string;
   amountUsd: string;
   at: string;
-  txHash: HexAddress;
+  txHash: string;
   tag?: 'soak' | 'external';
+  /** Base rows omit this. NEAR rows are `near:testnet`, never chain 8453. */
+  chain?: 'eip155:8453' | 'near:testnet';
 };
 
 export type FetchFn = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;

@@ -36,6 +36,13 @@ import { FileBlipsStore } from './blips-store.js';
 import { withMintLock } from './mint-lock.js';
 import { BLIP_DURATION_SEC, BLIP_PLANT_VERSION } from './blips-plant.js';
 import {
+  issueNearQuote,
+  nearAccept,
+  parseNearPayment,
+  readNearTestnetReceipt,
+  verifyPayment,
+} from './near-rail.js';
+import {
   buildQuote,
   buildRequirements,
   decodePayload,
@@ -113,10 +120,71 @@ export async function handleBlip(req: Request, ctx: ClearingContext): Promise<Re
     requirements,
     `X-PAYMENT required · Blips escalator LOCKED · ${priceCents}¢ at mintIndex ${mintIndex} · ${BLIPS_ESCALATOR_FORMULA}`,
   );
+  const nearPayTo = ctx.config.nearPayTo;
+  if (nearPayTo) {
+    const issued = issueNearQuote(ctx.ledger, {
+      receiver: nearPayTo,
+      amount: requirements.maxAmountRequired,
+      nowMs: ctx.now().getTime(),
+    });
+    quote.accepts.push(
+      nearAccept({
+        amount: requirements.maxAmountRequired,
+        payTo: nearPayTo,
+        resource: requirements.resource,
+        description: requirements.description,
+        memo: issued.nonce,
+      }),
+    );
+  }
 
   const paymentHeader = paymentHeaderFromRequest(req.headers);
   if (!paymentHeader) {
     return new Response(JSON.stringify(quote), { status: 402, headers: quoteHeaders(quote) });
+  }
+
+  const nearAttempt = parseNearPayment(paymentHeader);
+  if (nearAttempt) {
+    if (!nearPayTo) {
+      return json({ error: 'near rail is off', paid: false }, 402);
+    }
+    const ownerWallet = ownerFrom({ x402Version: 1, paymentId: '', nonce: '', accepted: requirements }, input.owner);
+    if (!ownerWallet) {
+      return json({ error: 'ownerWallet required (owner=)', paid: false }, 400);
+    }
+    const verdict = await verifyPayment({
+      ledger: ctx.ledger,
+      txHash: nearAttempt.txHash,
+      senderAccountId: nearAttempt.senderAccountId,
+      nonce: nearAttempt.nonce,
+      nowMs: ctx.now().getTime(),
+      readReceipt:
+        ctx.nearReceipts ??
+        ((txHash, senderAccountId) => readNearTestnetReceipt(txHash, senderAccountId, ctx.fetch)),
+    });
+    if (!verdict.ok) {
+      return json({ error: verdict.code, paid: false }, 402);
+    }
+    return withMintLock(ctx.config.dataDir, () =>
+      fulfillPaidBlip({
+        ctx,
+        picture,
+        input,
+        payload: {
+          x402Version: 1,
+          paymentId: `near:${verdict.txHash}`,
+          nonce: nearAttempt.nonce,
+          accepted: requirements,
+        },
+        ownerWallet,
+        mintIndex,
+        priceCents,
+        amountUsd,
+        paymentHeader,
+        requirements,
+        nearPaid: { txHash: verdict.txHash, senderAccountId: verdict.senderAccountId },
+      }),
+    );
   }
 
   let payload: PayloadBody;
@@ -161,6 +229,7 @@ async function fulfillPaidBlip(args: {
   amountUsd: number;
   paymentHeader: string;
   requirements: PaymentRequirements;
+  nearPaid?: { txHash: string; senderAccountId: string };
 }): Promise<Response> {
   const {
     ctx,
@@ -173,6 +242,7 @@ async function fulfillPaidBlip(args: {
     amountUsd,
     paymentHeader,
     requirements,
+    nearPaid,
   } = args;
   const prior = ctx.blips.getByPaymentId(payload.paymentId);
   if (prior) {
@@ -249,7 +319,9 @@ async function fulfillPaidBlip(args: {
     }
   }
 
-  const settle = await ctx.facilitator.settle(paymentHeader, requirements);
+  const settle = nearPaid
+    ? { ok: true as const, replayed: false, txHash: nearPaid.txHash, error: undefined }
+    : await ctx.facilitator.settle(paymentHeader, requirements);
   if (!settle.ok) {
     return json({ error: settle.error ?? 'payment not settled', paid: false, charged: false }, 402);
   }
@@ -289,7 +361,7 @@ async function fulfillPaidBlip(args: {
     ownerWallet: minted.ownerWallet,
     mintTx: minted.mintTx,
     paymentId: payload.paymentId,
-    payTx: settle.txHash,
+    payTx: nearPaid ? undefined : (settle.txHash as `0x${string}` | undefined),
     priceCents,
     picture: picture.picture,
     brief: input.brief,
@@ -304,14 +376,27 @@ async function fulfillPaidBlip(args: {
   });
 
   try {
-    ctx.settlements.add({
-      from: ownerWallet,
-      to: ctx.config.payTo,
-      amountUsd: String(amountUsd),
-      at: ctx.now().toISOString(),
-      txHash: (settle.txHash ?? minted.mintTx) as HexAddress,
-      tag: 'external',
-    });
+    if (nearPaid && ctx.config.nearPayTo) {
+      ctx.settlements.add({
+        from: nearPaid.senderAccountId,
+        to: ctx.config.nearPayTo,
+        amountUsd: String(amountUsd),
+        at: ctx.now().toISOString(),
+        txHash: nearPaid.txHash,
+        chain: 'near:testnet',
+        tag: 'external',
+      });
+    } else {
+      ctx.settlements.add({
+        from: ownerWallet,
+        to: ctx.config.payTo,
+        amountUsd: String(amountUsd),
+        at: ctx.now().toISOString(),
+        txHash: (settle.txHash ?? minted.mintTx) as HexAddress,
+        chain: 'eip155:8453',
+        tag: 'external',
+      });
+    }
   } catch {
     /* discover can lag */
   }
@@ -340,7 +425,7 @@ async function fulfillPaidBlip(args: {
       escalator: BLIPS_ESCALATOR_KIND,
       formula: BLIPS_ESCALATOR_FORMULA,
       mintIndexSource: 'settledPaid',
-      chainId: 8453,
+      ...(nearPaid ? { chain: 'near:testnet' as const } : { chainId: 8453 }),
       collection: 'Blips',
       market: false,
     },
