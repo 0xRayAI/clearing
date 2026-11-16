@@ -1,0 +1,21 @@
+[package]
+name = "clearing-escrow-token"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Test USDC stand-in. The real ft_resolve_transfer comes from near-contract-standards 5.7."
+
+[dependencies]
+near-sdk = "=5.7.0"
+near-contract-standards = "=5.7.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+overflow-checks = true
