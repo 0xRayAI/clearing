@@ -182,6 +182,7 @@ export function decodePayload(headerValue: string): PayloadBody {
   if (!body.accepted || typeof body.accepted !== 'object') {
     fail('x402_payload', 'payment payload missing accepted requirements', 402);
   }
+  rejectSplitAmount(body.accepted);
   return body as PayloadBody;
 }
 
@@ -194,6 +195,7 @@ function decodeV2Exact(raw: Record<string, unknown>): PayloadBody {
   if (!isHexBytes32(nonce) || !signature.startsWith('0x')) {
     fail('x402_payload', 'payment payload missing paymentId/nonce', 402);
   }
+  rejectSplitAmount(raw.accepted);
   const accepted = asRequirements(raw.accepted);
   if (!accepted) fail('x402_payload', 'payment payload missing accepted requirements', 402);
   const from = typeof authorization?.from === 'string' ? authorization.from : '';
@@ -204,9 +206,8 @@ function decodeV2Exact(raw: Record<string, unknown>): PayloadBody {
   }
   const claimed = asRecord(raw.accepted);
   const claimedPayTo = typeof claimed?.payTo === 'string' ? claimed.payTo : accepted.payTo;
-  const claimedAmount = claimed?.amount != null ? String(claimed.amount) : accepted.maxAmountRequired;
-  if (normalizeAddress(to) !== normalizeAddress(claimedPayTo) || value !== claimedAmount) {
-    fail('x402_payload', 'authorization does not match accepted payTo/amount', 402);
+  if (normalizeAddress(to) !== normalizeAddress(claimedPayTo)) {
+    fail('x402_payload', 'authorization does not match accepted payTo', 402);
   }
   return {
     x402Version: 2,
@@ -223,6 +224,14 @@ function decodeV2Exact(raw: Record<string, unknown>): PayloadBody {
       signature: signature as `0x${string}`,
     },
   };
+}
+
+function rejectSplitAmount(accepted: unknown): void {
+  const rec = asRecord(accepted);
+  if (!rec || rec.amount == null || rec.maxAmountRequired == null) return;
+  if (String(rec.amount) !== String(rec.maxAmountRequired)) {
+    fail('x402_payload', 'accepted amount and maxAmountRequired disagree', 402);
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

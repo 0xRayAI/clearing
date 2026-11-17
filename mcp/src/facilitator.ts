@@ -35,6 +35,15 @@ function readPayload(payloadB64: string): { body: PayloadBody } | { error: strin
 
 /** paymentId → sha256 of the one signed payload. Shared by every rail, before it posts. */
 const boundPayload = new Map<string, string>();
+/** First successful settle for that paymentId. A same-hash replay returns it and does not post. */
+const settledByPayment = new Map<string, SettleResult>();
+
+function valueMatchesQuote(body: PayloadBody, expected: PaymentRequirements): SettleResult | undefined {
+  if (body.eip3009 && body.eip3009.value !== expected.maxAmountRequired) {
+    return { ok: false, replayed: false, error: 'authorization value does not match quote' };
+  }
+  return undefined;
+}
 
 function claimSignedPayload(paymentId: string, payloadB64: string): SettleResult | undefined {
   const key = sha256Hex(payloadB64);
@@ -42,8 +51,15 @@ function claimSignedPayload(paymentId: string, payloadB64: string): SettleResult
   if (prior && prior !== key) {
     return { ok: false, replayed: false, error: 'paymentId already bound to a signed payload' };
   }
+  const stored = settledByPayment.get(paymentId);
+  if (stored) return { ok: true, txHash: stored.txHash, replayed: true };
   if (!prior) boundPayload.set(paymentId, key);
   return undefined;
+}
+
+function rememberSettle(paymentId: string, result: SettleResult): SettleResult {
+  if (result.ok) settledByPayment.set(paymentId, { ok: true, txHash: result.txHash, replayed: false });
+  return result;
 }
 
 export class MemoryFacilitator implements Facilitator {
@@ -58,16 +74,19 @@ export class MemoryFacilitator implements Facilitator {
     if (!requirementsMatch(body, expected)) {
       return { ok: false, replayed: false, error: 'payload does not match quote' };
     }
+    const quoted = valueMatchesQuote(body, expected);
+    if (quoted) return quoted;
     const conflict = claimSignedPayload(body.paymentId, payloadB64);
     if (conflict) return conflict;
     const key = sha256Hex(payloadB64);
     this.lastPayload = payloadB64;
     const existing = this.seen.get(key);
     if (existing) {
-      return { ok: true, txHash: existing, replayed: true };
+      return rememberSettle(body.paymentId, { ok: true, txHash: existing, replayed: true });
     }
     const txHash = (`0x${key}` as HexAddress);
     this.seen.set(key, txHash);
+    const settled = rememberSettle(body.paymentId, { ok: true, txHash, replayed: false });
     if (this.dropAfterSettleOnce) {
       this.dropAfterSettleOnce = false;
       const err = new Error('TCP dropped after facilitator settle');
@@ -79,7 +98,7 @@ export class MemoryFacilitator implements Facilitator {
       };
       throw err;
     }
-    return { ok: true, txHash, replayed: false };
+    return settled;
   }
 
   debitCount(): number {
@@ -226,6 +245,8 @@ export class CdpFacilitator implements Facilitator {
     if (!requirementsMatch(body, expected)) {
       return { ok: false, replayed: false, error: 'payload does not match quote' };
     }
+    const quoted = valueMatchesQuote(body, expected);
+    if (quoted) return quoted;
     const mapped = toCdpSettleBody(body, expected);
     if ('error' in mapped) {
       return { ok: false, replayed: false, error: mapped.error };
@@ -251,7 +272,11 @@ export class CdpFacilitator implements Facilitator {
       errorMessage?: string;
     };
     if (out.success === true && typeof out.transaction === 'string' && out.transaction.startsWith('0x')) {
-      return { ok: true, txHash: out.transaction as HexAddress, replayed: false };
+      return rememberSettle(body.paymentId, {
+        ok: true,
+        txHash: out.transaction as HexAddress,
+        replayed: false,
+      });
     }
     return {
       ok: false,
@@ -339,6 +364,8 @@ export class ZigzagFacilitator implements Facilitator {
     if (!requirementsMatch(body, expected)) {
       return { ok: false, replayed: false, error: 'payload does not match quote' };
     }
+    const quoted = valueMatchesQuote(body, expected);
+    if (quoted) return quoted;
     if (!body.eip3009) {
       return { ok: false, replayed: false, error: 'missing eip3009 authorization' };
     }
@@ -360,7 +387,7 @@ export class ZigzagFacilitator implements Facilitator {
     if (!json.txHash || !json.txHash.startsWith('0x')) {
       return { ok: false, replayed: false, error: 'zigzag settle missing txHash' };
     }
-    return { ok: true, txHash: json.txHash, replayed: false };
+    return rememberSettle(body.paymentId, { ok: true, txHash: json.txHash, replayed: false });
   }
 
   debitCount(): number {

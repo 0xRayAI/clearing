@@ -23,14 +23,24 @@ function headerOf(body: unknown): string {
   return Buffer.from(JSON.stringify(body)).toString('base64');
 }
 
-function withAuth(patch: { to?: string; value?: string; nonce?: string; signature?: string }): unknown {
+function withAuth(patch: {
+  to?: string;
+  value?: string;
+  nonce?: string;
+  signature?: string;
+  amount?: string;
+  maxAmountRequired?: string;
+}): unknown {
   const body = JSON.parse(JSON.stringify(fixture)) as {
+    accepted: { amount?: string; maxAmountRequired?: string };
     payload: { signature: string; authorization: { to: string; value: string; nonce: string } };
   };
   if (patch.to !== undefined) body.payload.authorization.to = patch.to;
   if (patch.value !== undefined) body.payload.authorization.value = patch.value;
   if (patch.nonce !== undefined) body.payload.authorization.nonce = patch.nonce;
   if (patch.signature !== undefined) body.payload.signature = patch.signature;
+  if (patch.amount !== undefined) body.accepted.amount = patch.amount;
+  if (patch.maxAmountRequired !== undefined) body.accepted.maxAmountRequired = patch.maxAmountRequired;
   return body;
 }
 
@@ -121,14 +131,15 @@ describe('x402 v2 exact payload', () => {
         return new Response(JSON.stringify({ success: true, transaction: `0x${'ab'.repeat(32)}` }));
       },
     });
-    const settled = await rail.settle(header, shopRequirements());
+    const cdpNonce = `0x${'15'.repeat(32)}`;
+    const settled = await rail.settle(headerOf(withAuth({ nonce: cdpNonce })), shopRequirements());
     expect(settled.ok).toBe(true);
     const body = posted[0] as {
       x402Version: number;
       paymentPayload: { payload: { authorization: { nonce: string } } };
     };
     expect(body.x402Version).toBe(2);
-    expect(body.paymentPayload.payload.authorization.nonce).toBe(NONCE);
+    expect(body.paymentPayload.payload.authorization.nonce).toBe(cdpNonce);
   });
 
   it('pays /v1/ping from a PAYMENT-SIGNATURE header', async () => {
@@ -142,8 +153,9 @@ describe('x402 v2 exact payload', () => {
         return new Response('ok', { status: 200 });
       },
     });
+    const pingHeader = headerOf(withAuth({ nonce: `0x${'16'.repeat(32)}` }));
     const live = await handlePing(
-      new Request(PING, { headers: { 'PAYMENT-SIGNATURE': header } }),
+      new Request(PING, { headers: { 'PAYMENT-SIGNATURE': pingHeader } }),
       ctx,
     );
     expect(live?.status).toBe(200);
@@ -151,7 +163,7 @@ describe('x402 v2 exact payload', () => {
     expect(paid.paid).toBe(true);
     expect(facilitator.debitCount()).toBe(1);
     const replay = await handlePing(
-      new Request(PING, { headers: { 'PAYMENT-SIGNATURE': header } }),
+      new Request(PING, { headers: { 'PAYMENT-SIGNATURE': pingHeader } }),
       ctx,
     );
     expect(replay?.status).toBe(200);
@@ -168,6 +180,7 @@ describe('x402 v2 exact payload', () => {
     }
     const ctx = createContext({
       config: { allowFake: true, signer: 'fake', facilitator: 'memory', payTo: PAY },
+      fetch: async () => new Response('{}', { status: 402 }),
     });
     const req = {
       method: 'GET',
@@ -187,6 +200,7 @@ describe('x402 v2 exact payload', () => {
     const ctx = createContext({
       config: { allowFake: true, signer: 'fake', facilitator: 'zigzag', payTo: PAY },
       facilitator: rail,
+      fetch: async () => new Response('{}', { status: 402 }),
     });
     const live = await handlePing(
       new Request(PING, {
@@ -200,11 +214,12 @@ describe('x402 v2 exact payload', () => {
     expect(posts()).toBe(0);
   });
 
-  it('rejects authorization.value that is not accepted.amount', async () => {
+  it('rejects authorization.value that is not the server quote', async () => {
     const { rail, posts } = zigzagRail();
     const ctx = createContext({
       config: { allowFake: true, signer: 'fake', facilitator: 'zigzag', payTo: PAY },
       facilitator: rail,
+      fetch: async () => new Response('{}', { status: 402 }),
     });
     const live = await handlePing(
       new Request(PING, {
@@ -216,6 +231,49 @@ describe('x402 v2 exact payload', () => {
     const body = (await live!.json()) as { paid?: boolean };
     expect(body.paid).not.toBe(true);
     expect(posts()).toBe(0);
+  });
+
+  it('rejects a split amount that underpays the quote', async () => {
+    const { rail, posts } = zigzagRail();
+    const ctx = createContext({
+      config: { allowFake: true, signer: 'fake', facilitator: 'zigzag', payTo: PAY },
+      facilitator: rail,
+      fetch: async () => new Response('{}', { status: 402 }),
+    });
+    const live = await handlePing(
+      new Request(PING, {
+        headers: {
+          'PAYMENT-SIGNATURE': headerOf(
+            withAuth({
+              nonce: `0x${'13'.repeat(32)}`,
+              amount: '1',
+              maxAmountRequired: '10000',
+              value: '1',
+            }),
+          ),
+        },
+      }),
+      ctx,
+    );
+    expect(live?.status).toBe(402);
+    const body = (await live!.json()) as { paid?: boolean };
+    expect(body.paid).not.toBe(true);
+    expect(posts()).toBe(0);
+  });
+
+  it('replays an identical header with one zigzag post', async () => {
+    const { rail, posts } = zigzagRail();
+    const nonce = `0x${'14'.repeat(32)}`;
+    const same = headerOf(withAuth({ nonce }));
+    const expected = shopRequirements();
+    const first = await rail.settle(same, expected);
+    expect(first.ok).toBe(true);
+    expect(first.replayed).toBe(false);
+    const again = await rail.settle(same, expected);
+    expect(again.ok).toBe(true);
+    expect(again.replayed).toBe(true);
+    expect(again.txHash).toBe(first.txHash);
+    expect(posts()).toBe(1);
   });
 
   it('does not settle a second body for the same paymentId on zigzag', async () => {
