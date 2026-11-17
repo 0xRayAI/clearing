@@ -7,6 +7,8 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { missingCdpKeyEnv } from './cdp-auth.js';
 import { isHexAddress, normalizeAddress } from './bytes.js';
 import { CdpFacilitator, createFacilitator } from './facilitator.js';
+import { readNearTestnetReceipt } from './near-rail.js';
+import { createNearSettler, loadTestnetMemoRows, type BookedPayment } from './near-settle.js';
 import { USDC_BASE } from './types.js';
 import type { ClearingContext } from './context.js';
 import type { FetchFn, HexAddress } from './types.js';
@@ -48,6 +50,14 @@ export function facilitatorTokenStatus(authorization: string | null): 'ok' | 'un
   const presented = authorization?.startsWith('Bearer ') ? authorization.slice('Bearer '.length).trim() : '';
   if (!presented || !timingSafeEqual(tokenDigest(presented), tokenDigest(expected))) return 'denied';
   return 'ok';
+}
+
+/** One receipt per memo for the hosted caller. The embeddable module keeps its own book. */
+const hostedNearBook = new Map<string, BookedPayment>();
+
+function isNearNetwork(raw: unknown): boolean {
+  const network = asRecord(asRecord(raw)?.paymentRequirements)?.network;
+  return typeof network === 'string' && network.startsWith('near:');
 }
 
 function isBaseNetwork(value: unknown): boolean {
@@ -171,6 +181,7 @@ export async function handleFacilitator(
     return json({ error: 'invalid json' }, 400);
   }
   const nowSec = opts.nowSec ?? BigInt(Math.floor(Date.now() / 1000));
+  if (isNearNetwork(raw)) return settleNear(url.pathname, raw, nowSec, ctx, opts.fetchFn);
   const blocked = exactPaymentVerdict(raw, nowSec);
   if (blocked) {
     if (url.pathname === '/verify') return json(blocked, 200);
@@ -187,4 +198,31 @@ export async function handleFacilitator(
   if (!verdict.isValid) return json({ success: false, errorReason: verdict.invalidReason }, 200);
   const settled = await opened.postX402('settle', raw);
   return json(settleFromCdp(settled.ok ? settled.json : undefined, settled.ok ? undefined : settled.error), 200);
+}
+
+/**
+ * Hosted /verify and /settle for near:* . One caller of the embeddable settler.
+ * The payee is the shop's own nearPayTo. Coinbase is not called.
+ * The relayer stays off: a foundry relays from its own account in-process.
+ */
+async function settleNear(
+  pathname: string,
+  raw: unknown,
+  nowSec: bigint,
+  ctx: ClearingContext,
+  fetchFn?: FetchFn,
+): Promise<Response> {
+  const fetchImpl = (fetchFn ?? fetch) as typeof fetch;
+  const payTo = ctx.config.nearPayTo;
+  const settler = createNearSettler({
+    allowPayTo: payTo ? [payTo] : [],
+    nowSec: () => nowSec,
+    readReceipt: (txHash, sender) => readNearTestnetReceipt(txHash, sender, fetchImpl),
+    findRows: (signerId) => loadTestnetMemoRows(signerId, fetchImpl),
+    book: hostedNearBook,
+  });
+  if (pathname === '/verify') return json(await settler.verify(raw), 200);
+  const settled = await settler.settle(raw);
+  if (settled.success) return json({ success: true, transaction: settled.transaction }, 200);
+  return json({ success: false, errorReason: settled.errorReason }, 200);
 }
