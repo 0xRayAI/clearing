@@ -1,11 +1,15 @@
-import { decodeFunctionData, pad, toHex } from 'viem';
+import { decodeFunctionData, encodeAbiParameters, keccak256, pad, toBytes, toHex } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { describe, expect, it } from 'vitest';
 import {
   BASE_MAINNET,
   BASE_SEPOLIA,
+  BASE_L1_GAS_ORACLE,
+  GAS_BALANCE_MARGIN_BPS,
   USDC_TRANSFER_TOPIC,
   createBaseSettler,
+  l1FeeCall,
+  nativeBalanceRequired,
   createCdpSigner,
   createSelfSigner,
   createZigzagSigner,
@@ -17,7 +21,10 @@ import {
   type TxLog,
   type TxReceipt,
 } from '../mcp/src/base-settle.js';
-import { USDC_BASE, USDC_EIP712_NAME, USDC_EIP712_VERSION } from '../mcp/src/types.js';
+import { USDC_EIP712_DOMAINS } from '../mcp/src/types.js';
+
+const MAINNET = USDC_EIP712_DOMAINS[0];
+const SEPOLIA = USDC_EIP712_DOMAINS[1];
 
 const PAYTO = '0xc9cd4e19e8ffabfc479352680295ba12e454462d' as `0x${string}`;
 const payer = privateKeyToAccount('0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80');
@@ -29,7 +36,7 @@ const TX = `0x${'ab'.repeat(32)}` as `0x${string}`;
 const advertised: AdvertisedExact = {
   scheme: 'exact',
   network: BASE_SEPOLIA,
-  asset: USDC_BASE,
+  asset: SEPOLIA.asset,
   amount: '10000',
   payTo: PAYTO,
   maxTimeoutSeconds: 60,
@@ -46,7 +53,10 @@ const AUTH_TYPES = {
   ],
 } as const;
 
-async function signAuth(over: Partial<Eip3009Authorization> = {}, chainId = 84532): Promise<Eip3009Authorization> {
+async function signAuth(
+  over: Partial<Eip3009Authorization> = {},
+  domain: (typeof USDC_EIP712_DOMAINS)[number] = SEPOLIA,
+): Promise<Eip3009Authorization> {
   const draft = {
     from: FROM,
     to: PAYTO,
@@ -58,10 +68,10 @@ async function signAuth(over: Partial<Eip3009Authorization> = {}, chainId = 8453
   };
   const signature = await payer.signTypedData({
     domain: {
-      name: USDC_EIP712_NAME,
-      version: USDC_EIP712_VERSION,
-      chainId,
-      verifyingContract: USDC_BASE,
+      name: domain.name,
+      version: domain.version,
+      chainId: domain.chainId,
+      verifyingContract: domain.asset,
     },
     types: AUTH_TYPES,
     primaryType: 'TransferWithAuthorization',
@@ -80,7 +90,7 @@ async function signAuth(over: Partial<Eip3009Authorization> = {}, chainId = 8453
 function transferLog(over: { token?: `0x${string}`; from?: `0x${string}`; to?: `0x${string}`; value?: string } = {}): TxLog {
   const value = BigInt(over.value ?? '10000');
   return {
-    address: over.token ?? USDC_BASE,
+    address: over.token ?? SEPOLIA.asset,
     topics: [
       USDC_TRANSFER_TOPIC,
       pad(over.from ?? FROM, { size: 32 }),
@@ -109,12 +119,13 @@ function guard(balance = 10n ** 18n): SelfGasGuard {
   return {
     nativeBalance: async () => balance,
     estimateGas: async () => 21_000n,
-    gasPrice: async () => 1n,
+    latestFee: async () => ({ baseFeePerGas: 1_000_000_000n, maxPriorityFeePerGas: 100_000_000n }),
+    l1Fee: async () => 1n,
   };
 }
 
 function self(submit: (call: { data: `0x${string}`; to: `0x${string}` }) => Promise<`0x${string}`>, balance?: bigint) {
-  return createSelfSigner(USDC_BASE, submit, guard(balance));
+  return createSelfSigner(SEPOLIA.asset, submit, guard(balance));
 }
 
 async function body(over: { amount?: string; payTo?: string; network?: string; asset?: string; value?: string; signature?: `0x${string}` } = {}) {
@@ -131,7 +142,7 @@ async function body(over: { amount?: string; payTo?: string; network?: string; a
       scheme: 'exact',
       network: over.network ?? BASE_SEPOLIA,
       amount: over.amount ?? '10000',
-      asset: over.asset ?? USDC_BASE,
+      asset: over.asset ?? SEPOLIA.asset,
       payTo: over.payTo ?? PAYTO,
       maxTimeoutSeconds: 60,
     },
@@ -162,7 +173,7 @@ describe('embeddable base settler', () => {
       expect(decoded.functionName).toBe('transferWithAuthorization');
       expect(String(decoded.args[1]).toLowerCase()).toBe(PAYTO);
       expect(decoded.args[2]).toBe(10000n);
-      expect(call.to).toBe(USDC_BASE);
+      expect(call.to).toBe(SEPOLIA.asset);
       return TX;
     });
     const settler = createBaseSettler({
@@ -268,10 +279,10 @@ describe('embeddable base settler', () => {
     const otherKey = privateKeyToAccount(generatePrivateKey());
     const signedByOther = await otherKey.signTypedData({
       domain: {
-        name: USDC_EIP712_NAME,
-        version: USDC_EIP712_VERSION,
-        chainId: 84532,
-        verifyingContract: USDC_BASE,
+        name: SEPOLIA.name,
+        version: SEPOLIA.version,
+        chainId: SEPOLIA.chainId,
+        verifyingContract: SEPOLIA.asset,
       },
       types: AUTH_TYPES,
       primaryType: 'TransferWithAuthorization',
@@ -388,17 +399,17 @@ describe('embeddable base settler', () => {
     expect(submits).toBe(0);
     const opened = createBaseSettler({
       allowPayTo: [PAYTO],
-      advertised: { ...advertised, network: BASE_MAINNET },
+      advertised: { ...advertised, network: BASE_MAINNET, asset: MAINNET.asset },
       allowMainnet: true,
       nowSec: () => NOW,
       signer: self(async () => TX),
-      chain: chain(),
+      chain: chain(receipt({ token: MAINNET.asset })),
     });
-    const mainAuth = await signAuth({}, 8453);
+    const mainAuth = await signAuth({}, MAINNET);
     const mainBody = {
       x402Version: 2,
       payload: { signature: mainAuth.signature, authorization: mainAuth },
-      accepted: { ...advertised, network: BASE_MAINNET, maxTimeoutSeconds: 60 },
+      accepted: { ...advertised, network: BASE_MAINNET, asset: MAINNET.asset, maxTimeoutSeconds: 60 },
     };
     expect(await opened.settle(mainBody)).toEqual({ success: true, transaction: TX });
     const wideAuth = await signAuth({
@@ -436,5 +447,132 @@ describe('embeddable base settler', () => {
       errorReason: 'foundry native balance is too low for gas',
     });
     expect(submits).toBe(0);
+  });
+
+  it('signs Sepolia as USDC and mainnet as USD Coin, matching DOMAIN_SEPARATOR', () => {
+    const typeHash = keccak256(toBytes('EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)'));
+    for (const row of USDC_EIP712_DOMAINS) {
+      const separator = keccak256(encodeAbiParameters(
+        [{ type: 'bytes32' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'address' }],
+        [typeHash, keccak256(toBytes(row.name)), keccak256(toBytes(row.version)), BigInt(row.chainId), row.asset],
+      ));
+      expect(separator).toBe(row.domainSeparator);
+    }
+    expect(SEPOLIA.name).toBe('USDC');
+    expect(SEPOLIA.asset).toBe('0x036CbD53842c5426634e7929541eC2318f3dCF7e');
+    expect(MAINNET.name).toBe('USD Coin');
+    expect(MAINNET.asset).toBe('0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913');
+  });
+
+  it('keeps a broadcast pending through a submit failure and a receipt timeout', async () => {
+    let submits = 0;
+    const failed = createBaseSettler({
+      allowPayTo: [PAYTO],
+      advertised,
+      nowSec: () => NOW,
+      signer: self(async () => {
+        submits += 1;
+        const err = new Error('submit failed after broadcast') as Error & { txHash?: `0x${string}` };
+        err.txHash = TX;
+        throw err;
+      }),
+      chain: chain(),
+    });
+    const payload = await body();
+    expect(await failed.settle(payload)).toEqual({
+      success: false,
+      errorReason: 'submit failed after broadcast',
+    });
+    expect(await failed.settle(payload)).toEqual({ success: true, transaction: TX });
+    expect(submits).toBe(1);
+
+    let reads = 0;
+    const slow = createBaseSettler({
+      allowPayTo: [PAYTO],
+      advertised,
+      nowSec: () => NOW,
+      signer: self(async () => {
+        submits += 1;
+        return TX;
+      }),
+      chain: {
+        authorizationState: async () => false,
+        receipt: async () => {
+          reads += 1;
+          if (reads === 1) throw new Error('receipt timeout');
+          return receipt();
+        },
+      },
+    });
+    expect(await slow.settle(payload)).toEqual({
+      success: false,
+      errorReason: 'chain has not confirmed the transfer',
+    });
+    expect(await slow.settle(payload)).toEqual({ success: true, transaction: TX });
+    expect(submits).toBe(2);
+    expect(reads).toBe(2);
+  });
+
+  it('prices gas as EIP-1559 max fee plus the Base L1 fee and a margin', async () => {
+    const gas = 21_000n;
+    const base = 100n;
+    const priority = 10n;
+    const l1 = 5_000n;
+    const maxFee = base + priority;
+    const bare = gas * maxFee + l1;
+    const need = nativeBalanceRequired(gas, maxFee, l1);
+    expect(need).toBe(bare + (bare * GAS_BALANCE_MARGIN_BPS) / 10_000n);
+    expect(need).toBeGreaterThan(bare);
+    const quote = l1FeeCall('0x1234');
+    expect(quote.to).toBe(BASE_L1_GAS_ORACLE);
+    expect(quote.to).toBe('0x420000000000000000000000000000000000000F');
+    let submits = 0;
+    const fees: SelfGasGuard = {
+      estimateGas: async () => gas,
+      latestFee: async () => ({ baseFeePerGas: base, maxPriorityFeePerGas: priority }),
+      l1Fee: async () => l1,
+      nativeBalance: async () => bare,
+    };
+    const short = createBaseSettler({
+      allowPayTo: [PAYTO],
+      advertised,
+      nowSec: () => NOW,
+      signer: createSelfSigner(SEPOLIA.asset, async () => {
+        submits += 1;
+        return TX;
+      }, fees),
+      chain: chain(),
+    });
+    expect(await short.settle(await body())).toEqual({
+      success: false,
+      errorReason: 'foundry native balance is too low for gas',
+    });
+    const covered: SelfGasGuard = { ...fees, nativeBalance: async () => need };
+    const ok = createBaseSettler({
+      allowPayTo: [PAYTO],
+      advertised,
+      nowSec: () => NOW,
+      signer: createSelfSigner(SEPOLIA.asset, async () => {
+        submits += 1;
+        return TX;
+      }, covered),
+      chain: chain(),
+    });
+    expect(await ok.settle(await body())).toEqual({ success: true, transaction: TX });
+    const blind = createBaseSettler({
+      allowPayTo: [PAYTO],
+      advertised,
+      nowSec: () => NOW,
+      signer: createSelfSigner(SEPOLIA.asset, async () => {
+        submits += 1;
+        return TX;
+      }, { ...fees, latestFee: async () => { throw new Error('no head'); } }),
+      chain: chain(),
+    });
+    expect(await blind.settle(await body())).toEqual({
+      success: false,
+      errorReason: 'foundry could not read the gas fee',
+    });
+    expect(submits).toBe(1);
   });
 });

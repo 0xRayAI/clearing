@@ -7,13 +7,17 @@
  */
 import { encodeFunctionData, pad, recoverTypedDataAddress, toHex } from 'viem';
 import { isHexAddress, isHexBytes32, normalizeAddress } from './bytes.js';
-import { USDC_EIP712_NAME, USDC_EIP712_VERSION } from './types.js';
+import { USDC_EIP712_DOMAINS } from './types.js';
 
 export const BASE_MAINNET = 'eip155:8453';
 export const BASE_SEPOLIA = 'eip155:84532';
 export const BASE_NETWORKS = [BASE_MAINNET, BASE_SEPOLIA] as const;
 export const VALIDITY_CAP_SECONDS = 60n;
 export const USDC_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef' as const;
+/** OP-stack GasPriceOracle predeploy. `getL1Fee(bytes)` is the L1 data fee. */
+export const BASE_L1_GAS_ORACLE = '0x420000000000000000000000000000000000000F' as const;
+/** Extra native balance required above gas * maxFeePerGas + l1Fee. 20%. */
+export const GAS_BALANCE_MARGIN_BPS = 2_000n;
 
 const TRANSFER_WITH_AUTHORIZATION = [
   {
@@ -93,10 +97,21 @@ export type BookedBasePayment = {
   network: BaseNetwork;
 };
 
+export type FeeSnapshot = {
+  baseFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+};
+
 export type SelfGasGuard = {
   nativeBalance: () => Promise<bigint>;
   estimateGas: (call: TransferCall) => Promise<bigint>;
-  gasPrice?: () => Promise<bigint>;
+  latestFee: () => Promise<FeeSnapshot>;
+  l1Fee: (call: TransferCall) => Promise<bigint>;
+};
+
+export type PendingBroadcast = {
+  kind: 'pending';
+  txHash: `0x${string}`;
 };
 
 export type BaseSettleDeps = {
@@ -155,6 +170,36 @@ export function encodeTransferWithAuthorization(auth: Eip3009Authorization): `0x
   });
 }
 
+const GET_L1_FEE = [
+  {
+    name: 'getL1Fee',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [{ name: '_data', type: 'bytes' }],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+] as const;
+
+export function l1FeeCall(txData: `0x${string}`): { to: typeof BASE_L1_GAS_ORACLE; data: `0x${string}` } {
+  return {
+    to: BASE_L1_GAS_ORACLE,
+    data: encodeFunctionData({ abi: GET_L1_FEE, functionName: 'getL1Fee', args: [txData] }),
+  };
+}
+
+export function maxFeePerGasOf(fee: FeeSnapshot): bigint {
+  if (fee.baseFeePerGas <= 0n || fee.maxPriorityFeePerGas < 0n) {
+    throw new Error('foundry could not read the gas fee');
+  }
+  return fee.baseFeePerGas + fee.maxPriorityFeePerGas;
+}
+
+export function nativeBalanceRequired(gas: bigint, maxFeePerGas: bigint, l1Fee: bigint): bigint {
+  if (gas <= 0n || maxFeePerGas <= 0n || l1Fee < 0n) throw new Error('foundry could not read the gas fee');
+  const need = gas * maxFeePerGas + l1Fee;
+  return need + (need * GAS_BALANCE_MARGIN_BPS) / 10_000n;
+}
+
 export function createSelfSigner(
   token: `0x${string}`,
   submit: (call: TransferCall) => Promise<`0x${string}`>,
@@ -169,10 +214,22 @@ export function createSelfSigner(
         data: encodeTransferWithAuthorization(auth),
         authorization: auth,
       };
-      const gas = await guard.estimateGas(call);
-      const price = guard.gasPrice ? await guard.gasPrice() : 1n;
-      const balance = await guard.nativeBalance();
-      if (balance < gas * price) throw new Error('foundry native balance is too low for gas');
+      let gas: bigint;
+      let fee: FeeSnapshot;
+      let l1: bigint;
+      let balance: bigint;
+      try {
+        gas = await guard.estimateGas(call);
+        fee = await guard.latestFee();
+        l1 = await guard.l1Fee(call);
+        balance = await guard.nativeBalance();
+      } catch (err) {
+        if (err instanceof Error && err.message === 'foundry native balance is too low for gas') throw err;
+        throw new Error('foundry could not read the gas fee');
+      }
+      const maxFee = maxFeePerGasOf(fee);
+      const need = nativeBalanceRequired(gas, maxFee, l1);
+      if (balance < need) throw new Error('foundry native balance is too low for gas');
       return submit(call);
     },
   };
@@ -285,12 +342,6 @@ const TRANSFER_AUTH_TYPES = {
   ],
 } as const;
 
-function chainIdOf(network: string): number | undefined {
-  if (network === BASE_MAINNET) return 8453;
-  if (network === BASE_SEPOLIA) return 84532;
-  return undefined;
-}
-
 function topicAddress(addr: string): `0x${string}` {
   return pad(normalizeAddress(addr), { size: 32 });
 }
@@ -299,15 +350,19 @@ function wordUint(value: bigint): `0x${string}` {
   return pad(toHex(value), { size: 32 });
 }
 
+export function usdcDomain(network: string, asset: string) {
+  return USDC_EIP712_DOMAINS.find((row) => row.network === network && sameAddress(row.asset, asset));
+}
+
 async function recoverPayer(auth: Eip3009Authorization, advertised: AdvertisedExact): Promise<`0x${string}`> {
-  const chainId = chainIdOf(advertised.network);
-  if (!chainId) throw new Error('network is not Base');
+  const row = usdcDomain(advertised.network, advertised.asset);
+  if (!row) throw new Error('asset has no EIP-712 domain on this chain');
   return recoverTypedDataAddress({
     domain: {
-      name: USDC_EIP712_NAME,
-      version: USDC_EIP712_VERSION,
-      chainId,
-      verifyingContract: advertised.asset,
+      name: row.name,
+      version: row.version,
+      chainId: row.chainId,
+      verifyingContract: row.asset,
     },
     types: TRANSFER_AUTH_TYPES,
     primaryType: 'TransferWithAuthorization',
@@ -326,7 +381,7 @@ async function recoverPayer(auth: Eip3009Authorization, advertised: AdvertisedEx
 export function createBaseSettler(deps: BaseSettleDeps) {
   const allow = new Set(deps.allowPayTo.map((item) => normalizeAddress(item)));
   const book = deps.book ?? new Map<string, BookedBasePayment>();
-  const locks = new Map<string, true>();
+  const locks = new Map<string, { kind: 'inflight' } | PendingBroadcast>();
   const advertised = deps.advertised;
   const cap = VALIDITY_CAP_SECONDS;
 
@@ -372,6 +427,52 @@ export function createBaseSettler(deps: BaseSettleDeps) {
     return 'receipt sender does not match the authorization';
   }
 
+  function bookPayment(txHash: `0x${string}`, auth: Eip3009Authorization): BookedBasePayment {
+    const booked: BookedBasePayment = {
+      txHash,
+      amount: advertised.amount,
+      payTo: normalizeAddress(advertised.payTo),
+      from: auth.from,
+      asset: normalizeAddress(advertised.asset),
+      network: advertised.network,
+    };
+    book.set(auth.nonce, booked);
+    return booked;
+  }
+
+  function broadcastHash(err: unknown): `0x${string}` | undefined {
+    if (!err || typeof err !== 'object' || !('txHash' in err)) return undefined;
+    const hash = (err as { txHash?: unknown }).txHash;
+    return typeof hash === 'string' && isEvmTxHash(hash) ? hash : undefined;
+  }
+
+  async function finishReceipt(txHash: `0x${string}`, auth: Eip3009Authorization, lockKey: string): Promise<BaseSettleResult> {
+    locks.set(lockKey, { kind: 'pending', txHash });
+    let receipt: TxReceipt | undefined;
+    try {
+      receipt = await deps.chain.receipt(txHash);
+    } catch {
+      receipt = undefined;
+    }
+    if (receipt && !receiptMatches(receipt, auth)) {
+      bookPayment(txHash, auth);
+      locks.delete(lockKey);
+      return { success: true, transaction: txHash };
+    }
+    let used = false;
+    try {
+      used = await deps.chain.authorizationState(auth.from, auth.nonce);
+    } catch {
+      used = false;
+    }
+    if (used) return { success: false, errorReason: 'authorization nonce is already used' };
+    if (receipt) {
+      const failed = receiptMatches(receipt, auth);
+      if (failed) return { success: false, errorReason: failed };
+    }
+    return { success: false, errorReason: 'chain has not confirmed the transfer' };
+  }
+
   return {
     async verify(raw: unknown): Promise<BaseVerifyResult> {
       const gated = gate(raw);
@@ -393,14 +494,20 @@ export function createBaseSettler(deps: BaseSettleDeps) {
         return { success: true, transaction: prior.txHash, replayed: true };
       }
       const lockKey = `${gated.auth.from}:${gated.auth.nonce.toLowerCase()}`;
-      if (locks.has(lockKey)) return { success: false, errorReason: 'authorization is already being submitted' };
-      locks.set(lockKey, true);
+      const held = locks.get(lockKey);
+      if (held?.kind === 'inflight') return { success: false, errorReason: 'authorization is already being submitted' };
+      if (held?.kind === 'pending') return finishReceipt(held.txHash, gated.auth, lockKey);
+      locks.set(lockKey, { kind: 'inflight' });
+      let txWentOut: `0x${string}` | undefined;
       try {
         let recovered: string;
         try {
           recovered = await recoverPayer(gated.auth, advertised);
-        } catch {
-          return { success: false, errorReason: 'authorization signature does not recover' };
+        } catch (err) {
+          const reason = err instanceof Error && err.message === 'asset has no EIP-712 domain on this chain'
+            ? err.message
+            : 'authorization signature does not recover';
+          return { success: false, errorReason: reason };
         }
         if (!sameAddress(recovered, gated.auth.from)) {
           return { success: false, errorReason: 'authorization signer is not the payer' };
@@ -416,29 +523,19 @@ export function createBaseSettler(deps: BaseSettleDeps) {
         try {
           txHash = await deps.signer.submit(gated.auth);
         } catch (err) {
+          const hash = broadcastHash(err);
+          if (hash) {
+            txWentOut = hash;
+            locks.set(lockKey, { kind: 'pending', txHash: hash });
+          }
           return { success: false, errorReason: err instanceof Error ? err.message : 'signer failed' };
         }
         if (!isEvmTxHash(txHash)) return { success: false, errorReason: 'signer did not return a 32-byte tx hash' };
-        let receipt: TxReceipt;
-        try {
-          receipt = await deps.chain.receipt(txHash);
-        } catch {
-          return { success: false, errorReason: 'chain has not confirmed the transfer' };
-        }
-        const failed = receiptMatches(receipt, gated.auth);
-        if (failed) return { success: false, errorReason: failed };
-        const booked: BookedBasePayment = {
-          txHash,
-          amount: advertised.amount,
-          payTo: normalizeAddress(advertised.payTo),
-          from: gated.auth.from,
-          asset: normalizeAddress(advertised.asset),
-          network: advertised.network,
-        };
-        book.set(gated.auth.nonce, booked);
-        return { success: true, transaction: txHash };
+        txWentOut = txHash;
+        locks.set(lockKey, { kind: 'pending', txHash });
+        return await finishReceipt(txHash, gated.auth, lockKey);
       } finally {
-        locks.delete(lockKey);
+        if (!txWentOut && locks.get(lockKey)?.kind === 'inflight') locks.delete(lockKey);
       }
     },
   };
