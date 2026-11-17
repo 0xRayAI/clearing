@@ -7,6 +7,7 @@ import { PAY_TO, makeCtx } from './helpers.js';
 
 const OTHER = '0x1111111111111111111111111111111111111111' as const;
 const TX = `0x${'cd'.repeat(32)}`;
+const TOKEN = 'facilitator-test-token';
 
 function ed25519Secret(): { id: string; secret: string } {
   const { privateKey } = generateKeyPairSync('ed25519');
@@ -21,14 +22,27 @@ function ed25519Secret(): { id: string; secret: string } {
 function withCdpEnv(run: () => Promise<void>): Promise<void> {
   const prevId = process.env.CDP_API_KEY_ID;
   const prevSecret = process.env.CDP_API_KEY_SECRET;
+  const prevToken = process.env.CLEARING_FACILITATOR_TOKEN;
   const keys = ed25519Secret();
   process.env.CDP_API_KEY_ID = keys.id;
   process.env.CDP_API_KEY_SECRET = keys.secret;
+  process.env.CLEARING_FACILITATOR_TOKEN = TOKEN;
   return run().finally(() => {
     if (prevId === undefined) delete process.env.CDP_API_KEY_ID;
     else process.env.CDP_API_KEY_ID = prevId;
     if (prevSecret === undefined) delete process.env.CDP_API_KEY_SECRET;
     else process.env.CDP_API_KEY_SECRET = prevSecret;
+    if (prevToken === undefined) delete process.env.CLEARING_FACILITATOR_TOKEN;
+    else process.env.CLEARING_FACILITATOR_TOKEN = prevToken;
+  });
+}
+
+function withToken(run: () => Promise<void>): Promise<void> {
+  const prevToken = process.env.CLEARING_FACILITATOR_TOKEN;
+  process.env.CLEARING_FACILITATOR_TOKEN = TOKEN;
+  return run().finally(() => {
+    if (prevToken === undefined) delete process.env.CLEARING_FACILITATOR_TOKEN;
+    else process.env.CLEARING_FACILITATOR_TOKEN = prevToken;
   });
 }
 
@@ -59,10 +73,12 @@ function body(payTo: string) {
   };
 }
 
-function post(path: '/verify' | '/settle', payload: unknown) {
+function post(path: '/verify' | '/settle', payload: unknown, token = TOKEN) {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
   return new Request(`https://clearing.rippel.ai${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(payload),
   });
 }
@@ -82,29 +98,77 @@ describe('x402 facilitator routes', () => {
     }
   });
 
+  it('requires the facilitator bearer and 503s when the token env is unset', async () => {
+    const prevToken = process.env.CLEARING_FACILITATOR_TOKEN;
+    delete process.env.CLEARING_FACILITATOR_TOKEN;
+    try {
+      const ctx = makeCtx({}, { config: { payTo: PAY_TO } });
+      const unset = await handleFacilitator(post('/verify', body(VORTEX_TREASURY), ''), ctx);
+      expect(unset?.status).toBe(503);
+      expect(((await unset!.json()) as { error?: string }).error).toBe('CLEARING_FACILITATOR_TOKEN is required');
+    } finally {
+      if (prevToken === undefined) delete process.env.CLEARING_FACILITATOR_TOKEN;
+      else process.env.CLEARING_FACILITATOR_TOKEN = prevToken;
+    }
+    await withToken(async () => {
+      const ctx = makeCtx({}, { config: { payTo: PAY_TO } });
+      const missing = await handleFacilitator(post('/settle', body(PAY_TO), ''), ctx);
+      const wrong = await handleFacilitator(post('/verify', body(PAY_TO), 'nope'), ctx);
+      expect(missing?.status).toBe(401);
+      expect(wrong?.status).toBe(401);
+    });
+  });
+
   it('rejects a payTo outside the treasury allowlist and does not call CDP', async () => {
-    const urls: string[] = [];
-    const ctx = makeCtx({}, { config: { payTo: PAY_TO } });
-    const fetchFn = async (input: string | URL | Request) => {
-      urls.push(String(input));
-      return new Response('{}');
-    };
-    const verified = await handleFacilitator(post('/verify', body(OTHER)), ctx, { fetchFn });
-    const verdict = (await verified!.json()) as { isValid: boolean; invalidReason?: string };
-    expect(verdict.isValid).toBe(false);
-    expect(verdict.invalidReason).toMatch(/treasury/);
-    const settled = await handleFacilitator(post('/settle', body(OTHER)), ctx, { fetchFn });
-    const paid = (await settled!.json()) as { success: boolean; errorReason?: string };
-    expect(paid.success).toBe(false);
-    expect(paid.errorReason).toMatch(/treasury/);
-    expect(urls).toEqual([]);
+    await withToken(async () => {
+      const urls: string[] = [];
+      const ctx = makeCtx({}, { config: { payTo: PAY_TO } });
+      const fetchFn = async (input: string | URL | Request) => {
+        urls.push(String(input));
+        return new Response('{}');
+      };
+      const verified = await handleFacilitator(post('/verify', body(OTHER)), ctx, { fetchFn });
+      const verdict = (await verified!.json()) as { isValid: boolean; invalidReason?: string };
+      expect(verdict.isValid).toBe(false);
+      expect(verdict.invalidReason).toMatch(/treasury/);
+      const settled = await handleFacilitator(post('/settle', body(OTHER)), ctx, { fetchFn });
+      const paid = (await settled!.json()) as { success: boolean; errorReason?: string };
+      expect(paid.success).toBe(false);
+      expect(paid.errorReason).toMatch(/treasury/);
+      expect(urls).toEqual([]);
+    });
+  });
+
+  it('rejects an amount that is not exact and a non-base network before CDP', async () => {
+    await withToken(async () => {
+      const urls: string[] = [];
+      const ctx = makeCtx({}, { config: { payTo: PAY_TO } });
+      const fetchFn = async (input: string | URL | Request) => {
+        urls.push(String(input));
+        return new Response('{}');
+      };
+      const over = body(PAY_TO);
+      over.paymentPayload.payload.authorization.value = '10001';
+      const network = body(PAY_TO);
+      (network.paymentRequirements as { network: string }).network = 'eip155:1';
+      const mismatchedTo = body(PAY_TO);
+      mismatchedTo.paymentPayload.payload.authorization.to = OTHER;
+      for (const payload of [over, network, mismatchedTo]) {
+        const settled = await handleFacilitator(post('/settle', payload), ctx, { fetchFn });
+        const paid = (await settled!.json()) as { success: boolean };
+        expect(paid.success).toBe(false);
+      }
+      expect(urls).toEqual([]);
+    });
   });
 
   it('returns 503 when CDP keys are absent', async () => {
     const prevId = process.env.CDP_API_KEY_ID;
     const prevSecret = process.env.CDP_API_KEY_SECRET;
+    const prevToken = process.env.CLEARING_FACILITATOR_TOKEN;
     delete process.env.CDP_API_KEY_ID;
     delete process.env.CDP_API_KEY_SECRET;
+    process.env.CLEARING_FACILITATOR_TOKEN = TOKEN;
     try {
       const ctx = makeCtx({}, { config: { payTo: PAY_TO } });
       const res = await handleFacilitator(post('/verify', body(VORTEX_TREASURY)), ctx);
@@ -118,6 +182,8 @@ describe('x402 facilitator routes', () => {
       else process.env.CDP_API_KEY_ID = prevId;
       if (prevSecret === undefined) delete process.env.CDP_API_KEY_SECRET;
       else process.env.CDP_API_KEY_SECRET = prevSecret;
+      if (prevToken === undefined) delete process.env.CLEARING_FACILITATOR_TOKEN;
+      else process.env.CLEARING_FACILITATOR_TOKEN = prevToken;
     }
   });
 
@@ -155,6 +221,29 @@ describe('x402 facilitator routes', () => {
       expect(paid.success).toBe(false);
       expect(paid.errorReason).toBe('bad sig');
       expect(urls).toEqual([CDP_VERIFY_URL]);
+    });
+  });
+
+  it('returns success false when CDP settle has no transaction hash', async () => {
+    await withCdpEnv(async () => {
+      const fetchFn = async (input: string | URL | Request) => {
+        if (String(input).endsWith('/verify')) return new Response(JSON.stringify({ isValid: true }));
+        throw new Error('timeout');
+      };
+      const ctx = makeCtx({}, { config: { payTo: PAY_TO } });
+      const timedOut = await handleFacilitator(post('/settle', body(PAY_TO)), ctx, { fetchFn });
+      const timeoutBody = (await timedOut!.json()) as { success: boolean; errorReason?: string; transaction?: string };
+      expect(timeoutBody.success).toBe(false);
+      expect(timeoutBody.transaction).toBeUndefined();
+      expect(timeoutBody.errorReason).toMatch(/timeout/);
+      const ambiguous = async (input: string | URL | Request) => {
+        if (String(input).endsWith('/verify')) return new Response(JSON.stringify({ isValid: true }));
+        return new Response(JSON.stringify({ success: true }));
+      };
+      const unsettled = await handleFacilitator(post('/settle', body(PAY_TO)), ctx, { fetchFn: ambiguous });
+      const paid = (await unsettled!.json()) as { success: boolean; transaction?: string };
+      expect(paid.success).toBe(false);
+      expect(paid.transaction).toBeUndefined();
     });
   });
 });
