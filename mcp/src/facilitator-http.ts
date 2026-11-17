@@ -12,6 +12,8 @@ import type { ClearingContext } from './context.js';
 import type { FetchFn, HexAddress } from './types.js';
 
 export const VORTEX_TREASURY = '0xd45CcF98D6db5A36E7CdD10ffae0b685BF27CE43' as const;
+/** Hangar payTo checked in at SKILL.md and kit.env. Not read from the environment. */
+export const HANGAR_TREASURY = '0xc9cD4E19e8fFabFC479352680295ba12e454462D' as const;
 
 export type FacilitatorVerify = { isValid: true } | { isValid: false; invalidReason: string };
 export type FacilitatorSettle =
@@ -30,22 +32,9 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value as Record<string, unknown>;
 }
 
-function addAddress(out: Set<string>, value: string | undefined): void {
-  if (!value || !isHexAddress(value.trim())) return;
-  out.add(normalizeAddress(value.trim()));
-}
-
-/** Vortex treasury, CLEARING_PAY_TO, the configured payTo, plus CLEARING_FACILITATOR_PAYTOS. */
-export function facilitatorPayToAllowlist(configPayTo?: string): Set<string> {
-  const out = new Set<string>();
-  addAddress(out, VORTEX_TREASURY);
-  addAddress(out, process.env.CLEARING_PAY_TO);
-  addAddress(out, configPayTo);
-  const extra = process.env.CLEARING_FACILITATOR_PAYTOS;
-  if (extra) {
-    for (const part of extra.split(/[\s,]+/)) addAddress(out, part);
-  }
-  return out;
+/** Vortex and the hangar treasury. Environment variables do not add addresses. */
+export function facilitatorPayToAllowlist(): Set<string> {
+  return new Set([normalizeAddress(VORTEX_TREASURY), normalizeAddress(HANGAR_TREASURY)]);
 }
 
 function tokenDigest(value: string): Buffer {
@@ -78,7 +67,7 @@ function sameAmount(left: string, right: string): boolean {
 /** Amount is exact. Authorization fields must equal the requirements. payTo must be allowlisted. */
 export function exactPaymentVerdict(
   raw: unknown,
-  configPayTo?: string,
+  nowSec: bigint,
 ): { isValid: false; invalidReason: string } | undefined {
   const body = asRecord(raw);
   const requirements = asRecord(body?.paymentRequirements);
@@ -90,6 +79,8 @@ export function exactPaymentVerdict(
   const payTo = typeof requirements.payTo === 'string' ? requirements.payTo : '';
   const to = typeof authorization.to === 'string' ? authorization.to : '';
   const asset = typeof requirements.asset === 'string' ? requirements.asset : '';
+  const validAfter = decimal(authorization.validAfter);
+  const validBefore = decimal(authorization.validBefore);
   if (!amount || !value || !sameAmount(value, amount)) {
     return { isValid: false, invalidReason: 'authorization.value must equal amount' };
   }
@@ -102,8 +93,11 @@ export function exactPaymentVerdict(
   if (!isBaseNetwork(requirements.network)) {
     return { isValid: false, invalidReason: 'network is not base' };
   }
-  if (!isHexAddress(payTo) || !facilitatorPayToAllowlist(configPayTo).has(normalizeAddress(payTo))) {
+  if (!isHexAddress(payTo) || !facilitatorPayToAllowlist().has(normalizeAddress(payTo))) {
     return { isValid: false, invalidReason: 'payTo is not an allowed treasury' };
+  }
+  if (!validAfter || !validBefore || !(BigInt(validAfter) <= nowSec && nowSec < BigInt(validBefore))) {
+    return { isValid: false, invalidReason: 'authorization is outside validAfter/validBefore' };
   }
   if (!isHexAddress(to) || normalizeAddress(to) !== normalizeAddress(payTo)) {
     return { isValid: false, invalidReason: 'authorization.to does not match payTo' };
@@ -162,7 +156,7 @@ function settleFromCdp(jsonBody: unknown, transportError?: string): FacilitatorS
 export async function handleFacilitator(
   req: Request,
   ctx: ClearingContext,
-  opts: { fetchFn?: FetchFn } = {},
+  opts: { fetchFn?: FetchFn; nowSec?: bigint } = {},
 ): Promise<Response | undefined> {
   const url = new URL(req.url);
   if (url.pathname !== '/verify' && url.pathname !== '/settle') return undefined;
@@ -176,7 +170,8 @@ export async function handleFacilitator(
   } catch {
     return json({ error: 'invalid json' }, 400);
   }
-  const blocked = exactPaymentVerdict(raw, ctx.config.payTo);
+  const nowSec = opts.nowSec ?? BigInt(Math.floor(Date.now() / 1000));
+  const blocked = exactPaymentVerdict(raw, nowSec);
   if (blocked) {
     if (url.pathname === '/verify') return json(blocked, 200);
     return json({ success: false, errorReason: blocked.invalidReason }, 200);
