@@ -4,6 +4,8 @@ Network: NEAR testnet. No mainnet call.
 
 Each walk is a new memo and its own relay. The in-process replay is a second settle of that same memo in the same process. It held on both walks: one relay, then the same hash. The two FINAL transactions are not a replay of each other.
 
+`clearing-treasury-0xray.testnet` is the hosted payee and the relay-gas account for `near:testnet` only. The `near:mainnet` payee list and relay account are empty.
+
 | Role | Account |
 | --- | --- |
 | Treasury payee | clearing-treasury-0xray.testnet |

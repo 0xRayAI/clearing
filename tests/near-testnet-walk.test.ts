@@ -236,7 +236,8 @@ describe.skipIf(!WALK)('NEAR testnet walk', () => {
       makeCtx(),
     );
     expect(await mainnet?.json()).toEqual({ isValid: false, invalidReason: 'mainnet cannot accept a testnet payee' });
-    expect(HOSTED_NEAR_PAYEES).toContain(TREASURY);
+    expect(HOSTED_NEAR_PAYEES['near:testnet']).toContain(TREASURY);
+    expect(HOSTED_NEAR_PAYEES['near:mainnet']).toEqual([]);
 
     const receiptPath = new URL('../scripts/near-testnet-receipt.md', import.meta.url);
     const header = [

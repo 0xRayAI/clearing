@@ -23,11 +23,29 @@ import type { FetchFn, HexAddress } from './types.js';
 export const VORTEX_TREASURY = '0xd45CcF98D6db5A36E7CdD10ffae0b685BF27CE43' as const;
 /** Hangar payTo checked in at SKILL.md and kit.env. Not read from the environment. */
 export const HANGAR_TREASURY = '0xc9cD4E19e8fFabFC479352680295ba12e454462D' as const;
+/** Blaze, testnet only. Pays the hosted testnet payee and the relay gas. Not a mainnet account. */
+export const NEAR_TESTNET_TREASURY = 'clearing-treasury-0xray.testnet' as const;
+
 /**
- * Hosted NEAR testnet payees. Literals only, same rule as the Base treasuries.
- * Testnet accounts only. CLEARING_NEAR_PAY_TO and config.nearPayTo are not read.
+ * Hosted NEAR payees by network. Literals only. Environment variables do not add accounts.
+ * near:mainnet stays empty, so a mainnet payment fails closed.
  */
-export const HOSTED_NEAR_PAYEES = ['clearing-treasury-0xray.testnet'] as const;
+export const HOSTED_NEAR_PAYEES = {
+  'near:testnet': [NEAR_TESTNET_TREASURY],
+  'near:mainnet': [],
+} as const;
+
+/** Relay-gas account by network. Mainnet has none. */
+export const HOSTED_NEAR_RELAYER = {
+  'near:testnet': NEAR_TESTNET_TREASURY,
+  'near:mainnet': '',
+} as const;
+
+export function hostedNearPayees(network: string): readonly string[] {
+  if (network === 'near:testnet') return HOSTED_NEAR_PAYEES['near:testnet'];
+  if (network === 'near:mainnet') return HOSTED_NEAR_PAYEES['near:mainnet'];
+  return [];
+}
 
 export type FacilitatorVerify = { isValid: true } | { isValid: false; invalidReason: string };
 export type FacilitatorSettle =
@@ -216,7 +234,8 @@ export async function handleFacilitator(
 
 /**
  * Hosted /verify and /settle for near:* . One caller of the embeddable settler.
- * Payees are HOSTED_NEAR_PAYEES. Coinbase is not called. The relayer stays off.
+ * The payee list is the one for that network. Coinbase is not called.
+ * Mainnet's list is empty, so the route returns before any RPC.
  */
 async function settleNear(
   pathname: string,
@@ -224,9 +243,16 @@ async function settleNear(
   nowSec: bigint,
   fetchFn?: FetchFn,
 ): Promise<Response> {
+  const network = String(asRecord(asRecord(raw)?.paymentRequirements)?.network ?? '');
+  const payees = hostedNearPayees(network);
+  if (payees.length === 0) {
+    const reason = network === 'near:mainnet' ? 'near:mainnet payee list is empty' : 'network is not near testnet';
+    if (pathname === '/verify') return json({ isValid: false, invalidReason: reason }, 200);
+    return json({ success: false, errorReason: reason }, 200);
+  }
   const fetchImpl = (fetchFn ?? fetch) as typeof fetch;
   const settler = createNearSettler({
-    allowPayTo: HOSTED_NEAR_PAYEES,
+    allowPayTo: payees,
     nowSec: () => nowSec,
     readReceipt: (txHash, txSigner, tokenSender) => readNearTestnetReceipt(txHash, txSigner, fetchImpl, tokenSender ?? txSigner),
     findRows: (signerId) => loadTestnetMemoRows(signerId, fetchImpl),

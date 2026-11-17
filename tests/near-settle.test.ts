@@ -1,6 +1,6 @@
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { HOSTED_NEAR_PAYEES, handleFacilitator } from '../mcp/src/facilitator-http.js';
+import { HOSTED_NEAR_PAYEES, HOSTED_NEAR_RELAYER, handleFacilitator } from '../mcp/src/facilitator-http.js';
 import { CIRCLE_USDC_NEAR_TESTNET, NEAR_TESTNET_RPC, type NearTransferView } from '../mcp/src/near-rail.js';
 import {
   DELEGATE_ATTEMPT_CAP,
@@ -433,8 +433,8 @@ describe('hosted near route', () => {
       return new Response('unexpected', { status: 500 });
     };
     try {
-      expect(HOSTED_NEAR_PAYEES).toEqual(['clearing-treasury-0xray.testnet']);
-      expect(HOSTED_NEAR_PAYEES.every((id) => id.endsWith('.testnet'))).toBe(true);
+      expect(HOSTED_NEAR_PAYEES['near:testnet']).toEqual(['clearing-treasury-0xray.testnet']);
+      expect(HOSTED_NEAR_RELAYER['near:testnet']).toBe('clearing-treasury-0xray.testnet');
       const ctx = makeCtx({}, { config: { nearPayTo: PAYEE } });
       const res = await handleFacilitator(
         new Request('https://clearing.test/settle', {
@@ -481,7 +481,9 @@ describe('hosted near route', () => {
         makeCtx(),
         { fetchFn: fetchFn as typeof fetch, nowSec: NOW },
       );
-      expect(await res?.json()).toEqual({ isValid: false, invalidReason: 'mainnet cannot accept a testnet payee' });
+      expect(HOSTED_NEAR_PAYEES['near:mainnet']).toEqual([]);
+      expect(HOSTED_NEAR_RELAYER['near:mainnet']).toBe('');
+      expect(await res?.json()).toEqual({ isValid: false, invalidReason: 'near:mainnet payee list is empty' });
       expect(urls).toEqual([]);
     } finally {
       if (prev === undefined) delete process.env.CLEARING_FACILITATOR_TOKEN;
