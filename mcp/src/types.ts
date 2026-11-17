@@ -1,11 +1,37 @@
 export const BASE_CHAIN_ID = 8453;
 export const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as const;
+export const USDC_BASE_SEPOLIA = '0x036CbD53842c5426634e7929541eC2318f3dCF7e' as const;
 export const IDENTITY_REGISTRY = '0x8004A169FB4a3325136EB29fA0ceB6D2e539a432' as const;
 export const USDC_DECIMALS = 6;
-/** FiatTokenV2 `name()` on Base. EIP-712 domain name — not ticker `USDC`. */
+/** Mainnet Base USDC `name()`. Sepolia's name is `USDC`. Use `USDC_EIP712_DOMAINS`. */
 export const USDC_EIP712_NAME = 'USD Coin' as const;
-/** FiatTokenV2 EIP-712 domain version. */
+/** FiatTokenV2 EIP-712 domain version on Base mainnet and Base Sepolia. */
 export const USDC_EIP712_VERSION = '2' as const;
+
+/**
+ * Per-chain USDC EIP-712 domain. Checked 2026-11-17 against public RPC
+ * `name()`, `version()`, and `DOMAIN_SEPARATOR()`. `eip712Domain()` reverts
+ * on both FiatToken contracts, so the separator is the on-chain domain check.
+ * Mainnet separator 0x02fa7265…a2c7834f. Sepolia separator 0x71f17a3b…4c9818.
+ */
+export const USDC_EIP712_DOMAINS = [
+  {
+    chainId: 8453,
+    network: 'eip155:8453',
+    asset: USDC_BASE,
+    name: 'USD Coin',
+    version: '2',
+    domainSeparator: '0x02fa7265e7c5d81118673727957699e4d68f74cd74b7db77da710fe8a2c7834f',
+  },
+  {
+    chainId: 84532,
+    network: 'eip155:84532',
+    asset: USDC_BASE_SEPOLIA,
+    name: 'USDC',
+    version: '2',
+    domainSeparator: '0x71f17a3b2ff373b803d70a5a07c046c1a2bc8e89c09ef722fcb047abe94c9818',
+  },
+] as const;
 export const ALWAYS_ALLOW_ORIGIN = 'api.clearing.dev';
 
 export type HexAddress = `0x${string}`;
