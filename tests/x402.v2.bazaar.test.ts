@@ -22,6 +22,14 @@ function ownerWord(addr: string): string {
   return `0x${addr.slice(2).toLowerCase().padStart(64, '0')}`;
 }
 
+function amountKeys(entry: object): string[] {
+  return Object.keys(entry).filter((key) => key === 'amount' || key === 'maxAmountRequired');
+}
+
+function assertOneAmountKey(entry: object): void {
+  expect(amountKeys(entry)).toEqual(['amount']);
+}
+
 function assertV2Bazaar(quote: X402Quote, tag: string): void {
   expect(quote.x402Version).toBe(2);
   expect(quote.resource.url).toMatch(/^https?:\/\//);
@@ -30,7 +38,7 @@ function assertV2Bazaar(quote: X402Quote, tag: string): void {
   expect(quote.resource.tags).toEqual([tag]);
   expect(quote.accepts[0]?.scheme).toBe('exact');
   expect(quote.accepts[0]?.network).toBe('eip155:8453');
-  expect(quote.accepts[0]?.amount).toBe(quote.accepts[0]?.maxAmountRequired);
+  for (const row of quote.accepts) assertOneAmountKey(row);
   assertBaseUsdcEip712(quote.accepts[0]?.extra);
   expect(quote.accepts[0]?.amount).toMatch(/^\d+$/);
   const bazaar = quote.extensions.bazaar;
@@ -66,7 +74,7 @@ describe('x402 v2 + bazaar', () => {
       tags: ['extract'],
     });
     assertV2Bazaar(quote, 'extract');
-    expect(quote.accepts[0]?.maxAmountRequired).toBe('20000');
+    expect(quote.accepts[0]?.amount).toBe('20000');
     expect(quote.extensions.bazaar.info.input.queryParams?.url).toBe('https://example.com');
   });
 
@@ -112,7 +120,9 @@ describe('x402 v2 + bazaar', () => {
     expect(res.headers.get(V2_REQUIRED_HEADER)).toBeTruthy();
     const quote = (await res.json()) as X402Quote;
     assertV2Bazaar(quote, 'extract');
-    expect(quote.accepts[0]?.maxAmountRequired).toBe('20000');
+    expect(quote.accepts[0]?.amount).toBe('20000');
+    const required = JSON.parse(Buffer.from(res.headers.get(V2_REQUIRED_HEADER)!, 'base64').toString()) as X402Quote;
+    for (const row of required.accepts) assertOneAmountKey(row);
     expect((ctx.facilitator as MemoryFacilitator).debitCount()).toBe(0);
   });
 
@@ -128,7 +138,7 @@ describe('x402 v2 + bazaar', () => {
     expect(res?.status).toBe(402);
     const quote = (await res!.json()) as X402Quote;
     assertV2Bazaar(quote, 'witness');
-    expect(quote.accepts[0]?.maxAmountRequired).toBe('20000');
+    expect(quote.accepts[0]?.amount).toBe('20000');
   });
 
   it('unpaid pin 402 is v2 with bazaar (no list side effect)', async () => {
@@ -153,7 +163,7 @@ describe('x402 v2 + bazaar', () => {
     expect(res?.status).toBe(402);
     const quote = (await res!.json()) as X402Quote;
     assertV2Bazaar(quote, 'pin');
-    expect(quote.accepts[0]?.maxAmountRequired).toBe('10000');
+    expect(quote.accepts[0]?.amount).toBe('10000');
     const listed = await (await import('../mcp/src/listed.js')).handleListed(
       new Request('http://127.0.0.1/v1/listed'),
       ctx,

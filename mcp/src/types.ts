@@ -91,11 +91,10 @@ export type PaymentRequirements = {
   extra: PaymentExtra;
 };
 
-/** Second 402 accept. Not an EIP-3009 requirement. No plain-NEAR entry. */
+/** Second 402 accept. Not an EIP-3009 requirement. No plain-NEAR entry. v2 carries `amount` only. */
 export type NearRailAccept = {
   scheme: 'exact';
   network: 'near:testnet';
-  maxAmountRequired: string;
   amount: string;
   asset: string;
   payTo: string;
@@ -119,7 +118,7 @@ export type PaymentExtra = {
   mintIndexSource?: 'settledPaid';
 };
 
-/** x402 v2 PaymentRequired. `accepts[]` keeps v1 fields so ZigZag still signs EIP-3009. */
+/** x402 v2 PaymentRequired. `accepts[]` uses `amount`. `maxAmountRequired` stays on the v1 payload. */
 export type BazaarExtension = {
   info: {
     input: {
@@ -150,7 +149,7 @@ export type X402Quote = {
     serviceName: string;
     tags?: string[];
   };
-  accepts: Array<(PaymentRequirements & { amount: string }) | NearRailAccept>;
+  accepts: Array<(Omit<PaymentRequirements, 'maxAmountRequired'> & { amount: string }) | NearRailAccept>;
   extensions: { bazaar: BazaarExtension };
 };
 

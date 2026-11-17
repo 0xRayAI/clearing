@@ -8,7 +8,7 @@ import type { PaymentRequirements } from '../mcp/src/types.js';
 const PAY = '0xc9cD4E19e8fFabFC479352680295ba12e454462D' as const;
 const FROM = '0x234a4B961908b20114980AF00c0974123763b48C' as const;
 
-function payHeader(accepts: PaymentRequirements) {
+function payHeader(accepts: PaymentRequirements & { amount?: string }) {
   return encodePayload({
     x402Version: 1,
     paymentId: 'card-1',
@@ -17,7 +17,7 @@ function payHeader(accepts: PaymentRequirements) {
     eip3009: {
       from: FROM,
       to: PAY,
-      value: accepts.maxAmountRequired,
+      value: accepts.amount || accepts.maxAmountRequired,
       validAfter: '0',
       validBefore: '9999999999',
       nonce: `0x${'11'.repeat(32)}`,

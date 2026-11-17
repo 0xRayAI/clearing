@@ -20,7 +20,7 @@ describe('GET skim', () => {
     const unpaid = await handleSkim(new Request('http://127.0.0.1/v1/skim?url=https://example.com/page'), ctx);
     expect(unpaid?.status).toBe(402);
     const quoted = (await unpaid!.json()) as { accepts: PaymentRequirements[] };
-    expect(quoted.accepts[0]?.maxAmountRequired).toBe('10000');
+    expect(quoted.accepts[0]?.amount).toBe('10000');
     const header = encodePayload({
       x402Version: 1,
       paymentId: 'skim-1',

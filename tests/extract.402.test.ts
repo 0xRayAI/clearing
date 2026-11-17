@@ -18,11 +18,11 @@ describe('extract 402', () => {
     const res = await handleExtract(new Request(extractUrl()), ctx);
     expect(res.status).toBe(402);
     const body = (await res.json()) as {
-      accepts: Array<{ asset: string; network: string; payTo: string; maxAmountRequired: string; extra: { name: string; version: string } }>;
+      accepts: Array<{ asset: string; network: string; payTo: string; amount: string; extra: { name: string; version: string } }>;
     };
     expect(body.accepts[0]?.network).toBe('eip155:8453');
     expect(body.accepts[0]?.asset.toLowerCase()).toBe('0x833589fcd6edb6e08f4c7c32d4f71b54bda02913');
-    expect(body.accepts[0]?.maxAmountRequired).toBe('20000');
+    expect(body.accepts[0]?.amount).toBe('20000');
     assertBaseUsdcEip712(body.accepts[0]?.extra);
     expect(res.headers.get(V2_REQUIRED_HEADER)).toBeTruthy();
     expect((ctx.facilitator as MemoryFacilitator).debitCount()).toBe(0);

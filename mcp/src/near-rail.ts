@@ -254,7 +254,6 @@ export function nearAccept(args: {
   return {
     scheme: 'exact',
     network: 'near:testnet',
-    maxAmountRequired: args.amount,
     amount: args.amount,
     asset: CIRCLE_USDC_NEAR_TESTNET,
     payTo: args.payTo,
