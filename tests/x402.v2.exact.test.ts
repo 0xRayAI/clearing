@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { createContext } from '../mcp/src/context.js';
 import { ClearingError } from '../mcp/src/errors.js';
-import { CdpFacilitator, MemoryFacilitator } from '../mcp/src/facilitator.js';
+import { CdpFacilitator, MemoryFacilitator, ZigzagFacilitator } from '../mcp/src/facilitator.js';
 import { dispatch } from '../mcp/src/http.js';
 import { handlePing } from '../mcp/src/ping.js';
 import { USDC_BASE, type PaymentRequirements } from '../mcp/src/types.js';
@@ -21,6 +21,26 @@ const fixture = JSON.parse(readFileSync(new URL('./fixtures/x402-v2-exact.json',
 
 function headerOf(body: unknown): string {
   return Buffer.from(JSON.stringify(body)).toString('base64');
+}
+
+function withAuth(patch: { to?: string; value?: string; nonce?: string; signature?: string }): unknown {
+  const body = JSON.parse(JSON.stringify(fixture)) as {
+    payload: { signature: string; authorization: { to: string; value: string; nonce: string } };
+  };
+  if (patch.to !== undefined) body.payload.authorization.to = patch.to;
+  if (patch.value !== undefined) body.payload.authorization.value = patch.value;
+  if (patch.nonce !== undefined) body.payload.authorization.nonce = patch.nonce;
+  if (patch.signature !== undefined) body.payload.signature = patch.signature;
+  return body;
+}
+
+function zigzagRail(): { rail: ZigzagFacilitator; posts: () => number } {
+  let posts = 0;
+  const rail = new ZigzagFacilitator('https://zigzag.test/settle', async () => {
+    posts += 1;
+    return new Response(JSON.stringify({ txHash: `0x${'11'.repeat(32)}` }));
+  });
+  return { rail, posts: () => posts };
 }
 
 function shopRequirements(): PaymentRequirements {
@@ -62,6 +82,8 @@ describe('x402 v2 exact payload', () => {
     expect(body.eip3009?.nonce).toBe(NONCE);
     expect(body.eip3009?.signature).toBe(fixture.payload.signature);
     expect(body.eip3009?.value).toBe('10000');
+    const lowerTo = decodePayload(headerOf(withAuth({ to: PAY.toLowerCase() })));
+    expect(lowerTo.eip3009?.to).toBe(PAY.toLowerCase());
   });
 
   it('settles one debit for that signed payload and refuses a second body', async () => {
@@ -158,5 +180,56 @@ describe('x402 v2 exact payload', () => {
     const res = { statusCode: 0, setHeader() {}, end() {} } as unknown as ServerResponse;
     await dispatch(req, res, ctx);
     expect(res.statusCode).toBe(402);
+  });
+
+  it('rejects authorization.to that is not accepted.payTo', async () => {
+    const { rail, posts } = zigzagRail();
+    const ctx = createContext({
+      config: { allowFake: true, signer: 'fake', facilitator: 'zigzag', payTo: PAY },
+      facilitator: rail,
+    });
+    const live = await handlePing(
+      new Request(PING, {
+        headers: { 'PAYMENT-SIGNATURE': headerOf(withAuth({ to: '0x0000000000000000000000000000000000000001' })) },
+      }),
+      ctx,
+    );
+    expect(live?.status).toBe(402);
+    const body = (await live!.json()) as { paid?: boolean };
+    expect(body.paid).not.toBe(true);
+    expect(posts()).toBe(0);
+  });
+
+  it('rejects authorization.value that is not accepted.amount', async () => {
+    const { rail, posts } = zigzagRail();
+    const ctx = createContext({
+      config: { allowFake: true, signer: 'fake', facilitator: 'zigzag', payTo: PAY },
+      facilitator: rail,
+    });
+    const live = await handlePing(
+      new Request(PING, {
+        headers: { 'PAYMENT-SIGNATURE': headerOf(withAuth({ value: '1' })) },
+      }),
+      ctx,
+    );
+    expect(live?.status).toBe(402);
+    const body = (await live!.json()) as { paid?: boolean };
+    expect(body.paid).not.toBe(true);
+    expect(posts()).toBe(0);
+  });
+
+  it('does not settle a second body for the same paymentId on zigzag', async () => {
+    const { rail, posts } = zigzagRail();
+    const nonce = `0x${'12'.repeat(32)}`;
+    const expected = shopRequirements();
+    const first = await rail.settle(headerOf(withAuth({ nonce })), expected);
+    expect(first.ok).toBe(true);
+    expect(posts()).toBe(1);
+    const second = await rail.settle(
+      headerOf(withAuth({ nonce, signature: `0x${'ee'.repeat(65)}` })),
+      expected,
+    );
+    expect(second.ok).toBe(false);
+    expect(posts()).toBe(1);
   });
 });

@@ -202,6 +202,12 @@ function decodeV2Exact(raw: Record<string, unknown>): PayloadBody {
   if (!isHexAddress(from) || !isHexAddress(to) || !value) {
     fail('x402_payload', 'payment payload missing paymentId/nonce', 402);
   }
+  const claimed = asRecord(raw.accepted);
+  const claimedPayTo = typeof claimed?.payTo === 'string' ? claimed.payTo : accepted.payTo;
+  const claimedAmount = claimed?.amount != null ? String(claimed.amount) : accepted.maxAmountRequired;
+  if (normalizeAddress(to) !== normalizeAddress(claimedPayTo) || value !== claimedAmount) {
+    fail('x402_payload', 'authorization does not match accepted payTo/amount', 402);
+  }
   return {
     x402Version: 2,
     paymentId: nonce,

@@ -33,10 +33,21 @@ function readPayload(payloadB64: string): { body: PayloadBody } | { error: strin
   }
 }
 
+/** paymentId → sha256 of the one signed payload. Shared by every rail, before it posts. */
+const boundPayload = new Map<string, string>();
+
+function claimSignedPayload(paymentId: string, payloadB64: string): SettleResult | undefined {
+  const key = sha256Hex(payloadB64);
+  const prior = boundPayload.get(paymentId);
+  if (prior && prior !== key) {
+    return { ok: false, replayed: false, error: 'paymentId already bound to a signed payload' };
+  }
+  if (!prior) boundPayload.set(paymentId, key);
+  return undefined;
+}
+
 export class MemoryFacilitator implements Facilitator {
   private readonly seen = new Map<string, HexAddress>();
-  /** paymentId → sha256 of the one signed payload. A second body must not debit. */
-  private readonly bound = new Map<string, string>();
   dropAfterSettleOnce = false;
   lastPayload?: string;
 
@@ -47,18 +58,15 @@ export class MemoryFacilitator implements Facilitator {
     if (!requirementsMatch(body, expected)) {
       return { ok: false, replayed: false, error: 'payload does not match quote' };
     }
+    const conflict = claimSignedPayload(body.paymentId, payloadB64);
+    if (conflict) return conflict;
     const key = sha256Hex(payloadB64);
-    const prior = this.bound.get(body.paymentId);
-    if (prior && prior !== key) {
-      return { ok: false, replayed: false, error: 'paymentId already bound to a signed payload' };
-    }
     this.lastPayload = payloadB64;
     const existing = this.seen.get(key);
     if (existing) {
       return { ok: true, txHash: existing, replayed: true };
     }
     const txHash = (`0x${key}` as HexAddress);
-    this.bound.set(body.paymentId, key);
     this.seen.set(key, txHash);
     if (this.dropAfterSettleOnce) {
       this.dropAfterSettleOnce = false;
@@ -222,6 +230,8 @@ export class CdpFacilitator implements Facilitator {
     if ('error' in mapped) {
       return { ok: false, replayed: false, error: mapped.error };
     }
+    const conflict = claimSignedPayload(body.paymentId, payloadB64);
+    if (conflict) return conflict;
     const verified = await this.cdpPost(CDP_VERIFY_PATH, mapped);
     if (!verified.ok) return verified.settle;
     const json = verified.json as { isValid?: boolean; valid?: boolean; invalidReason?: string };
@@ -332,6 +342,8 @@ export class ZigzagFacilitator implements Facilitator {
     if (!body.eip3009) {
       return { ok: false, replayed: false, error: 'missing eip3009 authorization' };
     }
+    const conflict = claimSignedPayload(body.paymentId, payloadB64);
+    if (conflict) return conflict;
     const token = process.env.CLEARING_RAIL_TOKEN || process.env.ZIGZAG_RAIL_TOKEN;
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (token) headers.authorization = `Bearer ${token}`;
