@@ -1,0 +1,29 @@
+{
+  "x402Version": 2,
+  "resource": {
+    "url": "https://clearing.rippel.ai/v1/skim",
+    "description": "x402 shop. Unpaid GET returns 402.",
+    "mimeType": "application/json"
+  },
+  "accepted": {
+    "scheme": "exact",
+    "network": "eip155:8453",
+    "amount": "10000",
+    "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "payTo": "0xc9cD4E19e8fFabFC479352680295ba12e454462D",
+    "maxTimeoutSeconds": 60,
+    "extra": { "name": "USD Coin", "version": "2" }
+  },
+  "payload": {
+    "signature": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "authorization": {
+      "from": "0x234a4B961908b20114980AF00c0974123763b48C",
+      "to": "0xc9cD4E19e8fFabFC479352680295ba12e454462D",
+      "value": "10000",
+      "validAfter": "0",
+      "validBefore": "9999999999",
+      "nonce": "0xabababababababababababababababababababababababababababababababab"
+    }
+  },
+  "extensions": {}
+}

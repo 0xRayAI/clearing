@@ -25,23 +25,40 @@ export interface Facilitator {
   debitCount(): number;
 }
 
+function readPayload(payloadB64: string): { body: PayloadBody } | { error: string } {
+  try {
+    return { body: decodePayload(payloadB64) };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : 'bad payload' };
+  }
+}
+
 export class MemoryFacilitator implements Facilitator {
   private readonly seen = new Map<string, HexAddress>();
+  /** paymentId → sha256 of the one signed payload. A second body must not debit. */
+  private readonly bound = new Map<string, string>();
   dropAfterSettleOnce = false;
   lastPayload?: string;
 
   async settle(payloadB64: string, expected: PaymentRequirements): Promise<SettleResult> {
-    const body = decodePayload(payloadB64);
+    const decoded = readPayload(payloadB64);
+    if ('error' in decoded) return { ok: false, replayed: false, error: decoded.error };
+    const body = decoded.body;
     if (!requirementsMatch(body, expected)) {
       return { ok: false, replayed: false, error: 'payload does not match quote' };
     }
     const key = sha256Hex(payloadB64);
+    const prior = this.bound.get(body.paymentId);
+    if (prior && prior !== key) {
+      return { ok: false, replayed: false, error: 'paymentId already bound to a signed payload' };
+    }
     this.lastPayload = payloadB64;
     const existing = this.seen.get(key);
     if (existing) {
       return { ok: true, txHash: existing, replayed: true };
     }
     const txHash = (`0x${key}` as HexAddress);
+    this.bound.set(body.paymentId, key);
     this.seen.set(key, txHash);
     if (this.dropAfterSettleOnce) {
       this.dropAfterSettleOnce = false;
@@ -195,7 +212,9 @@ export class CdpFacilitator implements Facilitator {
   ) {}
 
   async settle(payloadB64: string, expected: PaymentRequirements): Promise<SettleResult> {
-    const body = decodePayload(payloadB64);
+    const decoded = readPayload(payloadB64);
+    if ('error' in decoded) return { ok: false, replayed: false, error: decoded.error };
+    const body = decoded.body;
     if (!requirementsMatch(body, expected)) {
       return { ok: false, replayed: false, error: 'payload does not match quote' };
     }
@@ -304,8 +323,9 @@ export class ZigzagFacilitator implements Facilitator {
   ) {}
 
   async settle(payloadB64: string, expected: PaymentRequirements): Promise<SettleResult> {
-    const { decodePayload, requirementsMatch } = await import('./x402.js');
-    const body = decodePayload(payloadB64);
+    const decoded = readPayload(payloadB64);
+    if ('error' in decoded) return { ok: false, replayed: false, error: decoded.error };
+    const body = decoded.body;
     if (!requirementsMatch(body, expected)) {
       return { ok: false, replayed: false, error: 'payload does not match quote' };
     }
