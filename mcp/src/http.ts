@@ -9,6 +9,7 @@ import { handleSkim } from './skim.js';
 import { handleCard } from './card.js';
 import { handlePing } from './ping.js';
 import { handleListings } from './listings.js';
+import { handleFacilitator } from './facilitator-http.js';
 import type { ClearingContext } from './context.js';
 
 export function isExtractPath(pathname: string): boolean {
@@ -40,11 +41,15 @@ export function isExtractPath(pathname: string): boolean {
     pathname === '/.well-known/agent-registration.json' ||
     pathname === '/.well-known/agent-tools-verify.txt' ||
     pathname === '/.well-known/x402' ||
-    pathname === '/openapi.json'
+    pathname === '/openapi.json' ||
+    pathname === '/verify' ||
+    pathname === '/settle'
   );
 }
 
 export async function handleHangar(req: Request, ctx: ClearingContext): Promise<Response> {
+  const facilitator = await handleFacilitator(req, ctx);
+  if (facilitator) return facilitator;
   const ping = await handlePing(req, ctx);
   if (ping) return ping;
   const listings = await handleListings(req, ctx);

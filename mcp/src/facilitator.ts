@@ -289,9 +289,19 @@ export class CdpFacilitator implements Facilitator {
     return 0;
   }
 
+  async postX402(
+    kind: 'verify' | 'settle',
+    body: unknown,
+  ): Promise<{ ok: true; json: unknown } | { ok: false; error: string }> {
+    const path = kind === 'verify' ? CDP_VERIFY_PATH : CDP_SETTLE_PATH;
+    const result = await this.cdpPost(path, body);
+    if (!result.ok) return { ok: false, error: result.settle.error ?? 'cdp failed' };
+    return { ok: true, json: result.json };
+  }
+
   private async cdpPost(
     path: typeof CDP_VERIFY_PATH | typeof CDP_SETTLE_PATH,
-    body: CdpSettleBody,
+    body: unknown,
   ): Promise<{ ok: true; json: unknown } | { ok: false; settle: SettleResult }> {
     const apiKeyId = (this.opts.apiKeyId ?? process.env.CDP_API_KEY_ID ?? '').trim();
     const apiKeySecret = (this.opts.apiKeySecret ?? process.env.CDP_API_KEY_SECRET ?? '').trim();
