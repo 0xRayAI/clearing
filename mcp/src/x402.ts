@@ -123,6 +123,11 @@ export function httpGetBazaar(discovery: BazaarDiscovery): BazaarExtension {
   };
 }
 
+function v2Accept(req: PaymentRequirements): Omit<PaymentRequirements, 'maxAmountRequired'> & { amount: string } {
+  const { maxAmountRequired, ...rest } = req;
+  return { ...rest, amount: maxAmountRequired };
+}
+
 export function buildQuote(
   req: PaymentRequirements,
   error = 'X-PAYMENT header is required',
@@ -139,8 +144,8 @@ export function buildQuote(
       serviceName: discovery?.serviceName ?? 'Clearing',
       ...(tags && tags.length > 0 ? { tags } : {}),
     },
-    // v2 wants `amount`; keep v1 fields so ZigZag EIP-3009 still matches PaymentRequirements.
-    accepts: [{ ...req, amount: req.maxAmountRequired }],
+    // v2 name is `amount`. v1 payloads keep `maxAmountRequired` and must not repeat it here.
+    accepts: [v2Accept(req)],
     extensions: {
       bazaar: httpGetBazaar(
         discovery ?? {
@@ -269,11 +274,15 @@ export function signedFromPayload(payloadB64: string): SignedPayment {
   };
 }
 
+function acceptedAmount(accepted: { maxAmountRequired?: string; amount?: string }): string {
+  return accepted.maxAmountRequired || accepted.amount || '';
+}
+
 export function requirementsMatch(got: PayloadBody, expected: PaymentRequirements): boolean {
   return (
     got.accepted.scheme === 'exact' &&
     got.accepted.network === 'eip155:8453' &&
-    got.accepted.maxAmountRequired === expected.maxAmountRequired &&
+    acceptedAmount(got.accepted) === expected.maxAmountRequired &&
     normalizeAddress(got.accepted.payTo) === normalizeAddress(expected.payTo) &&
     normalizeAddress(got.accepted.asset) === normalizeAddress(expected.asset)
   );

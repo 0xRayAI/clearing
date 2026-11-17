@@ -34,7 +34,7 @@ async function pay(reqUrl: string, ctx: ReturnType<typeof makeCtx>, extra?: Requ
   const unpaid = await handleBlip(new Request(reqUrl), ctx);
   expect(unpaid?.status).toBe(402);
   const quote = (await unpaid!.json()) as {
-    accepts: Array<import('../mcp/src/types.js').PaymentRequirements>;
+    accepts: Array<import('../mcp/src/types.js').PaymentRequirements & { amount: string }>;
   };
   const header = encodePayload({
     x402Version: 1,
@@ -44,7 +44,7 @@ async function pay(reqUrl: string, ctx: ReturnType<typeof makeCtx>, extra?: Requ
     eip3009: {
       from: PAYER_A,
       to: ctx.config.payTo,
-      value: quote.accepts[0]!.maxAmountRequired,
+      value: quote.accepts[0]!.amount,
       validAfter: '0',
       validBefore: '9999999999',
       nonce: `0x${'11'.repeat(32)}`,
@@ -65,7 +65,7 @@ describe('hangar skill blip', () => {
     const body = (await res!.json()) as {
       error: string;
       accepts: Array<{
-        maxAmountRequired: string;
+        amount: string;
         network: string;
         extra: {
           name: string;
@@ -79,7 +79,7 @@ describe('hangar skill blip', () => {
       }>;
     };
     expect(body.accepts[0]?.network).toBe('eip155:8453');
-    expect(body.accepts[0]?.maxAmountRequired).toBe('50000');
+    expect(body.accepts[0]?.amount).toBe('50000');
     assertBaseUsdcEip712(body.accepts[0]?.extra);
     expect(body.accepts[0]?.extra.signer).toBe('zigzag');
     expect(body.accepts[0]?.extra.priceCents).toBe(5);
@@ -144,7 +144,7 @@ describe('hangar skill blip', () => {
     const ctx = makeCtx();
     const unpaid = await handleBlip(new Request(blipUrl()), ctx);
     const quote = (await unpaid!.json()) as {
-      accepts: Array<import('../mcp/src/types.js').PaymentRequirements>;
+      accepts: Array<import('../mcp/src/types.js').PaymentRequirements & { amount: string }>;
     };
     const paymentId = randomUUID();
     const header = encodePayload({
@@ -155,7 +155,7 @@ describe('hangar skill blip', () => {
       eip3009: {
         from: PAYER_A,
         to: ctx.config.payTo,
-        value: quote.accepts[0]!.maxAmountRequired,
+        value: quote.accepts[0]!.amount,
         validAfter: '0',
         validBefore: '9999999999',
         nonce: `0x${'11'.repeat(32)}`,
@@ -214,9 +214,9 @@ describe('hangar skill blip', () => {
       });
     }
     const res = await handleBlip(new Request(blipUrl()), ctx);
-    const body = (await res!.json()) as { accepts: Array<{ maxAmountRequired: string; extra: { priceCents: number } }> };
+    const body = (await res!.json()) as { accepts: Array<{ amount: string; extra: { priceCents: number } }> };
     expect(body.accepts[0]?.extra.priceCents).toBe(23);
-    expect(body.accepts[0]?.maxAmountRequired).toBe('230000');
+    expect(body.accepts[0]?.amount).toBe('230000');
   });
 
   it('My Account reads minter-owned tokenIds (not soft-DB alone)', async () => {

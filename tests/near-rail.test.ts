@@ -410,19 +410,21 @@ describe('NEAR USDC rail', () => {
     const unpaid = await handleBlip(new Request(url), ctx);
     expect(unpaid?.status).toBe(402);
     const quote = (await unpaid!.json()) as {
-      accepts: Array<{ network: string; asset?: string; payTo?: string; maxAmountRequired?: string; extra?: { method?: string; memo?: string } }>;
+      accepts: Array<{ network: string; asset?: string; payTo?: string; amount?: string; maxAmountRequired?: string; extra?: { method?: string; memo?: string } }>;
     };
     expect(quote.accepts[0]?.network).toBe('eip155:8453');
     const near = quote.accepts.find((row) => row.network === 'near:testnet');
     expect(near?.asset).toBe(CIRCLE_USDC_NEAR_TESTNET);
     expect(near?.payTo).toBe(FOUNDRY);
-    expect(near?.maxAmountRequired).toBe(quote.accepts[0]?.maxAmountRequired);
+    expect(near?.amount).toBe(quote.accepts[0]?.amount);
+    expect(Object.keys(quote.accepts[0]!).filter((key) => key === 'amount' || key === 'maxAmountRequired')).toEqual(['amount']);
+    expect(Object.keys(near!).filter((key) => key === 'amount' || key === 'maxAmountRequired')).toEqual(['amount']);
     expect(near?.extra?.method).toBe('ft_transfer');
     expect(near?.extra?.memo).toMatch(/^[0-9a-f]{32}$/);
     expect(quote.accepts.some((row) => row.network === 'near')).toBe(false);
 
     const nonce = near!.extra!.memo!;
-    const amount = near!.maxAmountRequired!;
+    const amount = near!.amount!;
     ctx.nearReceipts = async () => view({ amount, memo: nonce });
     const paid = await handleBlip(
       new Request(url, {

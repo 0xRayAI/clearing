@@ -21,10 +21,10 @@ describe('GET /v1/ping', () => {
     );
     expect(unpaid?.status).toBe(402);
     const quoted = (await unpaid!.json()) as {
-      accepts: Array<{ maxAmountRequired: string }>;
+      accepts: Array<{ amount: string }>;
       resource: { url: string };
     };
-    expect(quoted.accepts[0]?.maxAmountRequired).toBe('10000');
+    expect(quoted.accepts[0]?.amount).toBe('10000');
     expect(quoted.resource.url).toBe('https://clearing.rippel.ai/v1/skim');
     const { encodePayload } = await import('../mcp/src/x402.js');
     const header = encodePayload({
