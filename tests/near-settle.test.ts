@@ -1,12 +1,19 @@
+import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { handleFacilitator } from '../mcp/src/facilitator-http.js';
+import { HOSTED_NEAR_PAYEES, handleFacilitator } from '../mcp/src/facilitator-http.js';
 import { CIRCLE_USDC_NEAR_TESTNET, NEAR_TESTNET_RPC, type NearTransferView } from '../mcp/src/near-rail.js';
 import {
+  DELEGATE_ATTEMPT_CAP,
   NEAR_TESTNET_INDEXER,
+  NEAR_VALIDITY_CAP_SECONDS,
   createNearSettler,
+  encodeBase58,
+  encodeDelegateAction,
   loadTestnetMemoRows,
+  readNearTestnetAccessKey,
+  readNearTestnetBlock,
   selectPaidMemo,
-  type NearDelegate,
+  type NearChain,
 } from '../mcp/src/near-settle.js';
 import { makeCtx } from './helpers.js';
 
@@ -66,32 +73,76 @@ function directBody(over: {
   };
 }
 
-function delegateBody(delegate: NearDelegate, over: { amount?: string; payTo?: string; memo?: string } = {}) {
-  const memo = over.memo ?? delegate.memo;
+function chain(over: { height?: bigint; nonce?: bigint; fullAccess?: boolean; missing?: boolean } = {}): NearChain {
+  return {
+    blockHeight: async () => over.height ?? 1000n,
+    accessKey: async () => (over.missing ? undefined : { nonce: over.nonce ?? 5n, fullAccess: over.fullAccess ?? true }),
+  };
+}
+
+function signedDelegate(over: {
+  deposit?: string;
+  gas?: string;
+  nonce?: string;
+  maxBlockHeight?: string;
+  amount?: string;
+  memo?: string;
+  payTo?: string;
+  extraAction?: boolean;
+  badSig?: boolean;
+} = {}) {
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+  const rawPub = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
+  const memo = over.memo ?? 'memo-1';
+  const args = Buffer.from(JSON.stringify({
+    receiver_id: over.payTo ?? PAYEE,
+    amount: over.amount ?? '10000',
+    memo,
+  }));
+  const message = encodeDelegateAction({
+    senderId: BUYER,
+    receiverId: CIRCLE_USDC_NEAR_TESTNET,
+    methodName: 'ft_transfer',
+    args,
+    gas: BigInt(over.gas ?? '30000000000000'),
+    deposit: BigInt(over.deposit ?? '1'),
+    nonce: BigInt(over.nonce ?? '6'),
+    maxBlockHeight: BigInt(over.maxBlockHeight ?? '1010'),
+    publicKey: rawPub,
+  });
+  const digest = createHash('sha256').update(message).digest();
+  const sig = sign(null, digest, privateKey);
+  if (over.badSig) sig[0] = sig[0] === 0 ? 1 : 0;
+  const action = {
+    methodName: 'ft_transfer',
+    deposit: over.deposit ?? '1',
+    gas: over.gas ?? '30000000000000',
+    args: args.toString('base64'),
+  };
+  return {
+    delegateAction: {
+      senderId: BUYER,
+      receiverId: CIRCLE_USDC_NEAR_TESTNET,
+      actions: over.extraAction ? [action, { ...action, methodName: 'ft_transfer_call' }] : [action],
+      nonce: over.nonce ?? '6',
+      maxBlockHeight: over.maxBlockHeight ?? '1010',
+      publicKey: `ed25519:${encodeBase58(rawPub)}`,
+    },
+    signature: `ed25519:${encodeBase58(sig)}`,
+  };
+}
+
+function delegateBody(signed: ReturnType<typeof signedDelegate>, over: { amount?: string; payTo?: string; memo?: string } = {}) {
+  const memo = over.memo ?? 'memo-1';
   return {
     x402Version: 2,
-    paymentPayload: {
-      network: 'near:testnet',
-      payload: {
-        signedDelegate: {
-          delegateAction: {
-            senderId: delegate.senderId,
-            receiverId: delegate.receiverId,
-            actions: [{
-              methodName: delegate.methodName,
-              deposit: delegate.deposit,
-              args: { receiver_id: delegate.receiver_id, amount: delegate.amount, memo: delegate.memo },
-            }],
-          },
-        },
-      },
-    },
+    paymentPayload: { network: 'near:testnet', payload: { signedDelegate: signed } },
     paymentRequirements: {
       scheme: 'exact',
       network: 'near:testnet',
-      amount: over.amount ?? delegate.amount,
+      amount: over.amount ?? '10000',
       asset: CIRCLE_USDC_NEAR_TESTNET,
-      payTo: over.payTo ?? delegate.receiver_id,
+      payTo: over.payTo ?? PAYEE,
       validAfter: String(NOW - 10n),
       validBefore: String(NOW + 10n),
       extra: { method: 'ft_transfer', memo },
@@ -102,7 +153,8 @@ function delegateBody(delegate: NearDelegate, over: { amount?: string; payTo?: s
 function settler(opts: {
   rows?: ReturnType<typeof view>[];
   find?: (signerId: string) => Promise<readonly { hash?: string; memo?: string | null; delta?: string | null; token?: string | null; receiver?: string | null; amount?: string | null }[]>;
-  relay?: (delegate: NearDelegate) => Promise<{ txHash: string; senderAccountId: string }>;
+  relay?: (delegate: unknown) => Promise<{ txHash: string; senderAccountId: string }>;
+  chain?: NearChain;
   allow?: readonly string[];
   seen?: string[];
 } = {}) {
@@ -116,6 +168,7 @@ function settler(opts: {
     },
     findRows: opts.find,
     relay: opts.relay,
+    chain: opts.chain,
   });
 }
 
@@ -195,44 +248,139 @@ describe('near settler module', () => {
     expect(await foundry.settle(directBody())).toEqual({ success: true, transaction: HASH });
   });
 
-  it('verifies a delegate locally and settles it only through the foundry relayer', async () => {
-    const delegate: NearDelegate = {
-      senderId: BUYER,
-      receiverId: CIRCLE_USDC_NEAR_TESTNET,
-      methodName: 'ft_transfer',
-      deposit: '1',
-      receiver_id: PAYEE,
-      amount: '10000',
-      memo: 'memo-1',
-    };
+  it('rejects a validity window longer than the Base cap', async () => {
+    const open = await settler({ rows: [view()] }).verify(directBody({
+      txHash: HASH,
+      validAfter: String(NOW),
+      validBefore: String(NOW + NEAR_VALIDITY_CAP_SECONDS),
+    }));
+    expect(open).toEqual({ isValid: true });
+    const wide = await settler().verify(directBody({
+      txHash: HASH,
+      validAfter: String(NOW),
+      validBefore: String(NOW + NEAR_VALIDITY_CAP_SECONDS + 1n),
+    }));
+    expect(wide).toEqual({ isValid: false, invalidReason: 'validity window exceeds 60 seconds' });
+  });
+
+  it('verifies a signed delegate against the access key and relays it once', async () => {
     const calls: string[] = [];
-    const bare = settler();
-    expect(await bare.verify(delegateBody(delegate))).toEqual({ isValid: true });
-    expect(await bare.settle(delegateBody(delegate))).toEqual({ success: false, errorReason: 'relayer is not configured' });
+    const bare = settler({ chain: chain() });
+    const body = delegateBody(signedDelegate());
+    expect(await bare.verify(body)).toEqual({ isValid: true });
+    expect(await bare.settle(body)).toEqual({ success: false, errorReason: 'relayer is not configured' });
     const relayed = settler({
+      chain: chain(),
       relay: async () => {
         calls.push('relay');
         return { txHash: HASH, senderAccountId: BUYER };
       },
       rows: [view()],
     });
-    expect(await relayed.settle(delegateBody(delegate))).toEqual({ success: true, transaction: HASH });
-    expect(await relayed.settle(delegateBody(delegate))).toEqual({ success: true, transaction: HASH, replayed: true });
+    expect(await relayed.settle(body)).toEqual({ success: true, transaction: HASH });
+    expect(await relayed.settle(body)).toEqual({ success: true, transaction: HASH, replayed: true });
     expect(calls).toEqual(['relay']);
   });
 
+  it('rejects a bad signature, an extra action, a stale nonce, and a short block height before relay', async () => {
+    const calls: string[] = [];
+    const foundry = settler({
+      chain: chain(),
+      relay: async () => {
+        calls.push('relay');
+        return { txHash: HASH, senderAccountId: BUYER };
+      },
+    });
+    expect(await foundry.verify(delegateBody(signedDelegate({ badSig: true })))).toEqual({
+      isValid: false,
+      invalidReason: 'delegate signature does not match the public key',
+    });
+    expect(await foundry.verify(delegateBody(signedDelegate({ extraAction: true })))).toEqual({
+      isValid: false,
+      invalidReason: 'delegate must contain exactly one action',
+    });
+    expect(await foundry.verify(delegateBody(signedDelegate({ nonce: '5' })))).toEqual({
+      isValid: false,
+      invalidReason: 'delegate nonce is not above the access key nonce',
+    });
+    expect(await foundry.verify(delegateBody(signedDelegate({ maxBlockHeight: '1000' })))).toEqual({
+      isValid: false,
+      invalidReason: 'delegate max_block_height is not above the current block',
+    });
+    expect(calls).toEqual([]);
+  });
+
+  it('rejects a key that is missing or not full access', async () => {
+    const missing = settler({ chain: chain({ missing: true }) });
+    expect(await missing.verify(delegateBody(signedDelegate()))).toEqual({
+      isValid: false,
+      invalidReason: 'delegate public key is not an access key',
+    });
+    const limited = settler({ chain: chain({ fullAccess: false }) });
+    expect(await limited.verify(delegateBody(signedDelegate()))).toEqual({
+      isValid: false,
+      invalidReason: 'delegate public key is not a full access key',
+    });
+  });
+
+  it('locks a delegate before relay and does not relay a failed one again', async () => {
+    expect(DELEGATE_ATTEMPT_CAP).toBe(1);
+    let release: () => void = () => {};
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let calls = 0;
+    const overlapping = settler({
+      chain: chain(),
+      relay: async () => {
+        calls += 1;
+        await hold;
+        return { txHash: HASH, senderAccountId: BUYER };
+      },
+      rows: [view()],
+    });
+    const body = delegateBody(signedDelegate());
+    const first = overlapping.settle(body);
+    const second = overlapping.settle(body);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(calls).toBe(1);
+    release();
+    const settled = await Promise.all([first, second]);
+    expect(settled.filter((row) => row.success && !('replayed' in row && row.replayed))).toHaveLength(1);
+    expect(settled.some((row) => !row.success && row.errorReason === 'delegate is already settling')).toBe(true);
+
+    let failedCalls = 0;
+    const failed = settler({
+      chain: chain(),
+      relay: async () => {
+        failedCalls += 1;
+        throw new Error('relay down');
+      },
+    });
+    const failedBody = delegateBody(signedDelegate({ memo: 'memo-fail' }), { memo: 'memo-fail' });
+    expect(await failed.settle(failedBody)).toEqual({ success: false, errorReason: 'relayer did not return a tx hash' });
+    expect(await failed.settle(failedBody)).toEqual({ success: false, errorReason: 'delegate relay attempt cap reached' });
+    expect(failedCalls).toBe(1);
+  });
+
   it('rejects a delegate whose deposit is not 1 yocto', async () => {
-    const delegate: NearDelegate = {
-      senderId: BUYER,
-      receiverId: CIRCLE_USDC_NEAR_TESTNET,
-      methodName: 'ft_transfer',
-      deposit: '0',
-      receiver_id: PAYEE,
-      amount: '10000',
-      memo: 'memo-1',
-    };
-    const result = await settler().verify(delegateBody(delegate));
+    const result = await settler().verify(delegateBody(signedDelegate({ deposit: '0' })));
     expect(result).toEqual({ isValid: false, invalidReason: 'delegate deposit is not 1 yocto' });
+  });
+
+  it('reads the access key and the block from testnet RPC only', async () => {
+    const urls: string[] = [];
+    const fetchFn = async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      urls.push(url);
+      const body = JSON.parse(String(init?.body)) as { method?: string };
+      if (body.method === 'block') return new Response(JSON.stringify({ result: { header: { height: 1000 } } }));
+      return new Response(JSON.stringify({ result: { nonce: 5, permission: 'FullAccess' } }));
+    };
+    expect(await readNearTestnetBlock(fetchFn as typeof fetch)).toBe(1000n);
+    expect(await readNearTestnetAccessKey(BUYER, 'ed25519:key', fetchFn as typeof fetch)).toEqual({ nonce: 5n, fullAccess: true });
+    expect(urls).toEqual([NEAR_TESTNET_RPC, NEAR_TESTNET_RPC]);
   });
 
   it('loads memo rows from the testnet indexer only', async () => {
@@ -259,55 +407,41 @@ describe('near settler module', () => {
 });
 
 describe('hosted near route', () => {
-  it('settles near:testnet without calling Coinbase', async () => {
-    const prev = process.env.CLEARING_FACILITATOR_TOKEN;
+  it('does not take a hosted payee from the environment', async () => {
+    const prevToken = process.env.CLEARING_FACILITATOR_TOKEN;
+    const prevNear = process.env.CLEARING_NEAR_PAY_TO;
+    const prevExtra = process.env.CLEARING_FACILITATOR_PAYTOS;
     process.env.CLEARING_FACILITATOR_TOKEN = TOKEN;
+    process.env.CLEARING_NEAR_PAY_TO = PAYEE;
+    process.env.CLEARING_FACILITATOR_PAYTOS = PAYEE;
     const urls: string[] = [];
-    const args = Buffer.from(JSON.stringify({ amount: '10000', memo: 'hosted-memo', receiver_id: PAYEE })).toString('base64');
     const fetchFn = async (input: string | URL | Request) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
       urls.push(url);
-      if (url !== NEAR_TESTNET_RPC) return new Response('unexpected', { status: 500 });
-      return new Response(JSON.stringify({
-        result: {
-          final_execution_status: 'FINAL',
-          status: { SuccessValue: '' },
-          transaction: {
-            signer_id: BUYER,
-            receiver_id: CIRCLE_USDC_NEAR_TESTNET,
-            actions: [{ FunctionCall: { method_name: 'ft_transfer', args } }],
-          },
-          receipts_outcome: [{
-            outcome: {
-              executor_id: CIRCLE_USDC_NEAR_TESTNET,
-              logs: [`EVENT_JSON:${JSON.stringify({
-                standard: 'nep141',
-                event: 'ft_transfer',
-                data: [{ old_owner_id: BUYER, new_owner_id: PAYEE, amount: '10000', memo: 'hosted-memo' }],
-              })}`],
-            },
-          }],
-        },
-      }));
+      return new Response('unexpected', { status: 500 });
     };
     try {
+      expect(HOSTED_NEAR_PAYEES).toEqual([]);
       const ctx = makeCtx({}, { config: { nearPayTo: PAYEE } });
       const res = await handleFacilitator(
         new Request('https://clearing.test/settle', {
           method: 'POST',
           headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
-          body: JSON.stringify(directBody({ memo: 'hosted-memo', txHash: HASH })),
+          body: JSON.stringify(directBody({ txHash: HASH })),
         }),
         ctx,
         { fetchFn: fetchFn as typeof fetch, nowSec: NOW },
       );
       expect(res?.status).toBe(200);
-      expect(await res?.json()).toEqual({ success: true, transaction: HASH });
-      expect(urls).toEqual([NEAR_TESTNET_RPC]);
-      expect(urls.some((url) => url.includes('coinbase'))).toBe(false);
+      expect(await res?.json()).toEqual({ success: false, errorReason: 'payTo is not an allowed treasury' });
+      expect(urls).toEqual([]);
     } finally {
-      if (prev === undefined) delete process.env.CLEARING_FACILITATOR_TOKEN;
-      else process.env.CLEARING_FACILITATOR_TOKEN = prev;
+      if (prevToken === undefined) delete process.env.CLEARING_FACILITATOR_TOKEN;
+      else process.env.CLEARING_FACILITATOR_TOKEN = prevToken;
+      if (prevNear === undefined) delete process.env.CLEARING_NEAR_PAY_TO;
+      else process.env.CLEARING_NEAR_PAY_TO = prevNear;
+      if (prevExtra === undefined) delete process.env.CLEARING_FACILITATOR_PAYTOS;
+      else process.env.CLEARING_FACILITATOR_PAYTOS = prevExtra;
     }
   });
 });

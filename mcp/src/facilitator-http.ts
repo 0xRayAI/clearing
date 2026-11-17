@@ -8,7 +8,14 @@ import { missingCdpKeyEnv } from './cdp-auth.js';
 import { isHexAddress, normalizeAddress } from './bytes.js';
 import { CdpFacilitator, createFacilitator } from './facilitator.js';
 import { readNearTestnetReceipt } from './near-rail.js';
-import { createNearSettler, loadTestnetMemoRows, type BookedPayment } from './near-settle.js';
+import {
+  createNearSettler,
+  loadTestnetMemoRows,
+  readNearTestnetAccessKey,
+  readNearTestnetBlock,
+  type BookedPayment,
+  type DelegateLock,
+} from './near-settle.js';
 import { USDC_BASE } from './types.js';
 import type { ClearingContext } from './context.js';
 import type { FetchFn, HexAddress } from './types.js';
@@ -16,6 +23,12 @@ import type { FetchFn, HexAddress } from './types.js';
 export const VORTEX_TREASURY = '0xd45CcF98D6db5A36E7CdD10ffae0b685BF27CE43' as const;
 /** Hangar payTo checked in at SKILL.md and kit.env. Not read from the environment. */
 export const HANGAR_TREASURY = '0xc9cD4E19e8fFabFC479352680295ba12e454462D' as const;
+/**
+ * Hosted NEAR testnet payees. Literals only, same rule as the Base treasuries.
+ * No NEAR treasury account is checked into this repo, so the list stays empty.
+ * CLEARING_NEAR_PAY_TO and config.nearPayTo are not read.
+ */
+export const HOSTED_NEAR_PAYEES: readonly string[] = [];
 
 export type FacilitatorVerify = { isValid: true } | { isValid: false; invalidReason: string };
 export type FacilitatorSettle =
@@ -54,6 +67,8 @@ export function facilitatorTokenStatus(authorization: string | null): 'ok' | 'un
 
 /** One receipt per memo for the hosted caller. The embeddable module keeps its own book. */
 const hostedNearBook = new Map<string, BookedPayment>();
+/** One relay attempt per delegate for the hosted caller. */
+const hostedDelegateLocks = new Map<string, DelegateLock>();
 
 function isNearNetwork(raw: unknown): boolean {
   const network = asRecord(asRecord(raw)?.paymentRequirements)?.network;
@@ -181,7 +196,7 @@ export async function handleFacilitator(
     return json({ error: 'invalid json' }, 400);
   }
   const nowSec = opts.nowSec ?? BigInt(Math.floor(Date.now() / 1000));
-  if (isNearNetwork(raw)) return settleNear(url.pathname, raw, nowSec, ctx, opts.fetchFn);
+  if (isNearNetwork(raw)) return settleNear(url.pathname, raw, nowSec, opts.fetchFn);
   const blocked = exactPaymentVerdict(raw, nowSec);
   if (blocked) {
     if (url.pathname === '/verify') return json(blocked, 200);
@@ -202,24 +217,26 @@ export async function handleFacilitator(
 
 /**
  * Hosted /verify and /settle for near:* . One caller of the embeddable settler.
- * The payee is the shop's own nearPayTo. Coinbase is not called.
- * The relayer stays off: a foundry relays from its own account in-process.
+ * Payees are HOSTED_NEAR_PAYEES. Coinbase is not called. The relayer stays off.
  */
 async function settleNear(
   pathname: string,
   raw: unknown,
   nowSec: bigint,
-  ctx: ClearingContext,
   fetchFn?: FetchFn,
 ): Promise<Response> {
   const fetchImpl = (fetchFn ?? fetch) as typeof fetch;
-  const payTo = ctx.config.nearPayTo;
   const settler = createNearSettler({
-    allowPayTo: payTo ? [payTo] : [],
+    allowPayTo: HOSTED_NEAR_PAYEES,
     nowSec: () => nowSec,
     readReceipt: (txHash, sender) => readNearTestnetReceipt(txHash, sender, fetchImpl),
     findRows: (signerId) => loadTestnetMemoRows(signerId, fetchImpl),
     book: hostedNearBook,
+    delegateLocks: hostedDelegateLocks,
+    chain: {
+      blockHeight: () => readNearTestnetBlock(fetchImpl),
+      accessKey: (accountId, publicKey) => readNearTestnetAccessKey(accountId, publicKey, fetchImpl),
+    },
   });
   if (pathname === '/verify') return json(await settler.verify(raw), 200);
   const settled = await settler.settle(raw);
