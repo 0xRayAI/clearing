@@ -1,6 +1,6 @@
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { HOSTED_NEAR_PAYEES, handleFacilitator } from '../mcp/src/facilitator-http.js';
+import { HOSTED_NEAR_PAYEES, HOSTED_NEAR_RELAYER, handleFacilitator } from '../mcp/src/facilitator-http.js';
 import { CIRCLE_USDC_NEAR_TESTNET, NEAR_TESTNET_RPC, type NearTransferView } from '../mcp/src/near-rail.js';
 import {
   DELEGATE_ATTEMPT_CAP,
@@ -161,10 +161,10 @@ function settler(opts: {
   return createNearSettler({
     allowPayTo: opts.allow ?? [PAYEE],
     nowSec: () => NOW,
-    readReceipt: async (txHash, sender) => {
-      opts.seen?.push(`${sender}:${txHash}`);
+    readReceipt: async (txHash, txSigner, tokenSender) => {
+      opts.seen?.push(`${txSigner}:${tokenSender ?? txSigner}:${txHash}`);
       const row = opts.rows?.find((item) => item.memo && txHash) ?? view();
-      return { ...row, senderAccountId: sender };
+      return { ...row, senderAccountId: tokenSender ?? txSigner };
     },
     findRows: opts.find,
     relay: opts.relay,
@@ -214,7 +214,7 @@ describe('near settler module', () => {
   it('rejects mainnet before any chain read', async () => {
     const reads: string[] = [];
     const result = await settler({ seen: reads }).verify(directBody({ network: 'near:mainnet', txHash: HASH }));
-    expect(result).toEqual({ isValid: false, invalidReason: 'network is not near testnet' });
+    expect(result).toEqual({ isValid: false, invalidReason: 'mainnet cannot accept a testnet payee' });
     expect(reads).toEqual([]);
   });
 
@@ -308,6 +308,18 @@ describe('near settler module', () => {
       invalidReason: 'delegate max_block_height is not above the current block',
     });
     expect(calls).toEqual([]);
+  });
+
+  it('queries a relayed transfer with the relayer and matches the payer', async () => {
+    const calls: string[] = [];
+    const foundry = settler({
+      chain: chain(),
+      seen: calls,
+      relay: async () => ({ txHash: HASH, senderAccountId: 'relayer.testnet' }),
+      rows: [view()],
+    });
+    expect(await foundry.settle(delegateBody(signedDelegate()))).toEqual({ success: true, transaction: HASH });
+    expect(calls).toEqual([`relayer.testnet:${BUYER}:${HASH}`]);
   });
 
   it('rejects a key that is missing or not full access', async () => {
@@ -421,7 +433,8 @@ describe('hosted near route', () => {
       return new Response('unexpected', { status: 500 });
     };
     try {
-      expect(HOSTED_NEAR_PAYEES).toEqual([]);
+      expect(HOSTED_NEAR_PAYEES['near:testnet']).toEqual(['clearing-treasury-0xray.testnet']);
+      expect(HOSTED_NEAR_RELAYER['near:testnet']).toBe('clearing-treasury-0xray.testnet');
       const ctx = makeCtx({}, { config: { nearPayTo: PAYEE } });
       const res = await handleFacilitator(
         new Request('https://clearing.test/settle', {
@@ -442,6 +455,39 @@ describe('hosted near route', () => {
       else process.env.CLEARING_NEAR_PAY_TO = prevNear;
       if (prevExtra === undefined) delete process.env.CLEARING_FACILITATOR_PAYTOS;
       else process.env.CLEARING_FACILITATOR_PAYTOS = prevExtra;
+    }
+  });
+
+  it('rejects a testnet payee on near:mainnet before any RPC', async () => {
+    const prev = process.env.CLEARING_FACILITATOR_TOKEN;
+    process.env.CLEARING_FACILITATOR_TOKEN = TOKEN;
+    const urls: string[] = [];
+    const fetchFn = async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      urls.push(url);
+      return new Response('unexpected', { status: 500 });
+    };
+    try {
+      const res = await handleFacilitator(
+        new Request('https://clearing.test/verify', {
+          method: 'POST',
+          headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+          body: JSON.stringify(directBody({
+            payTo: 'clearing-treasury-0xray.testnet',
+            network: 'near:mainnet',
+            txHash: HASH,
+          })),
+        }),
+        makeCtx(),
+        { fetchFn: fetchFn as typeof fetch, nowSec: NOW },
+      );
+      expect(HOSTED_NEAR_PAYEES['near:mainnet']).toEqual([]);
+      expect(HOSTED_NEAR_RELAYER['near:mainnet']).toBe('');
+      expect(await res?.json()).toEqual({ isValid: false, invalidReason: 'near:mainnet payee list is empty' });
+      expect(urls).toEqual([]);
+    } finally {
+      if (prev === undefined) delete process.env.CLEARING_FACILITATOR_TOKEN;
+      else process.env.CLEARING_FACILITATOR_TOKEN = prev;
     }
   });
 });

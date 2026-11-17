@@ -40,3 +40,5 @@ CLEARING_PAY_TO=         # seller’s Base address; USDC lands here
 ```
 
 Settlement is Base (`eip155:8453`) USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`. Buyers sign EIP-3009 with domain name `USD Coin` and version `2`. The paid request URL must be public `https`. Clearing’s own filter in `mcp/src/facilitator.ts` skips `*.railway.app` hostnames and `/v1/ping`, so attach a custom domain. Each seller brings their own CDP account and keys. This repo does not hold them.
+
+NEAR is separate and testnet only. `HOSTED_NEAR_PAYEES['near:testnet']` is `clearing-treasury-0xray.testnet`, which is also the relay-gas account (`HOSTED_NEAR_RELAYER['near:testnet']`). `HOSTED_NEAR_PAYEES['near:mainnet']` and `HOSTED_NEAR_RELAYER['near:mainnet']` are empty, so a mainnet payment fails closed and no mainnet relay account is configured.
