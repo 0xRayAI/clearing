@@ -25,10 +25,9 @@ export const VORTEX_TREASURY = '0xd45CcF98D6db5A36E7CdD10ffae0b685BF27CE43' as c
 export const HANGAR_TREASURY = '0xc9cD4E19e8fFabFC479352680295ba12e454462D' as const;
 /**
  * Hosted NEAR testnet payees. Literals only, same rule as the Base treasuries.
- * No NEAR treasury account is checked into this repo, so the list stays empty.
- * CLEARING_NEAR_PAY_TO and config.nearPayTo are not read.
+ * Testnet accounts only. CLEARING_NEAR_PAY_TO and config.nearPayTo are not read.
  */
-export const HOSTED_NEAR_PAYEES: readonly string[] = [];
+export const HOSTED_NEAR_PAYEES = ['clearing-treasury-0xray.testnet'] as const;
 
 export type FacilitatorVerify = { isValid: true } | { isValid: false; invalidReason: string };
 export type FacilitatorSettle =
@@ -229,7 +228,7 @@ async function settleNear(
   const settler = createNearSettler({
     allowPayTo: HOSTED_NEAR_PAYEES,
     nowSec: () => nowSec,
-    readReceipt: (txHash, sender) => readNearTestnetReceipt(txHash, sender, fetchImpl),
+    readReceipt: (txHash, txSigner, tokenSender) => readNearTestnetReceipt(txHash, txSigner, fetchImpl, tokenSender ?? txSigner),
     findRows: (signerId) => loadTestnetMemoRows(signerId, fetchImpl),
     book: hostedNearBook,
     delegateLocks: hostedDelegateLocks,

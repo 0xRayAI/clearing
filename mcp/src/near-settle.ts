@@ -113,6 +113,8 @@ type DirectClaim = {
   memo: string;
   signerId: string;
   txHash?: string;
+  /** Outer transaction signer. A relayed ft_transfer is signed by the relayer. */
+  txSigner: string;
 };
 
 type DelegateClaim = {
@@ -489,6 +491,10 @@ function requirementsOf(raw: unknown, nowSec: bigint): { ok: true; requirements:
   const requirements = asRecord(body?.paymentRequirements);
   if (!requirements) return { ok: false, reason: 'payment requirements are incomplete' };
   const network = typeof requirements.network === 'string' ? requirements.network : '';
+  const payToEarly = typeof requirements.payTo === 'string' ? requirements.payTo : '';
+  if (network === 'near:mainnet' && payToEarly.endsWith('.testnet')) {
+    return { ok: false, reason: 'mainnet cannot accept a testnet payee' };
+  }
   if (network !== 'near:testnet') return { ok: false, reason: 'network is not near testnet' };
   if (requirements.asset !== CIRCLE_USDC_NEAR_TESTNET) return { ok: false, reason: 'asset is not testnet USDC' };
   const amount = decimal(requirements.amount);
@@ -497,7 +503,9 @@ function requirementsOf(raw: unknown, nowSec: bigint): { ok: true; requirements:
   const validBefore = decimal(requirements.validBefore);
   const extra = asRecord(requirements.extra);
   const memo = typeof extra?.memo === 'string' ? extra.memo : '';
-  if (!amount || !isNearAccountId(payTo) || !memo) return { ok: false, reason: 'payment requirements are incomplete' };
+  if (!amount || !isNearAccountId(payTo) || !payTo.endsWith('.testnet') || !memo) {
+    return { ok: false, reason: payTo && !payTo.endsWith('.testnet') ? 'payTo is not a testnet account' : 'payment requirements are incomplete' };
+  }
   if (validAfter === undefined || validBefore === undefined) return { ok: false, reason: 'authorization is outside validAfter/validBefore' };
   const after = BigInt(validAfter);
   const before = BigInt(validBefore);
@@ -522,9 +530,12 @@ function claimOf(raw: unknown, requirements: Requirements): { ok: true; claim: C
   const signerId = typeof payload.signerId === 'string' ? payload.signerId : '';
   const memo = typeof payload.memo === 'string' ? payload.memo : '';
   const txHash = typeof payload.txHash === 'string' ? payload.txHash : undefined;
-  if (!isNearAccountId(signerId) || memo !== requirements.memo) return { ok: false, reason: 'payment payload is incomplete' };
+  const txSigner = typeof payload.txSigner === 'string' ? payload.txSigner : signerId;
+  if (!isNearAccountId(signerId) || !isNearAccountId(txSigner) || memo !== requirements.memo) {
+    return { ok: false, reason: 'payment payload is incomplete' };
+  }
   if (txHash !== undefined && !isNearTxHash(txHash)) return { ok: false, reason: 'tx hash is not a NEAR transaction' };
-  return { ok: true, claim: { kind: 'direct', memo, signerId, txHash } };
+  return { ok: true, claim: { kind: 'direct', memo, signerId, txHash, txSigner } };
 }
 
 function viewMatches(view: NearTransferView, requirements: Requirements, signerId: string, txHash: string): string | undefined {
@@ -617,8 +628,8 @@ export function createNearSettler(deps: NearSettleDeps) {
     return { ok: true, requirements: requirements.requirements, claim: claim.claim };
   }
 
-  async function locate(requirements: Requirements, claim: DirectClaim): Promise<{ ok: true; txHash: string; signerId: string } | { ok: false; reason: string }> {
-    if (claim.txHash) return { ok: true, txHash: claim.txHash, signerId: claim.signerId };
+  async function locate(requirements: Requirements, claim: DirectClaim): Promise<{ ok: true; txHash: string; signerId: string; txSigner: string } | { ok: false; reason: string }> {
+    if (claim.txHash) return { ok: true, txHash: claim.txHash, signerId: claim.signerId, txSigner: claim.txSigner };
     if (!deps.findRows) return { ok: false, reason: 'payment not found' };
     let rows: readonly NearPaidRow[];
     try {
@@ -634,17 +645,17 @@ export function createNearSettler(deps: NearSettleDeps) {
     });
     if (found.mismatch) return { ok: false, reason: found.mismatch };
     if (!found.hash) return { ok: false, reason: 'payment not found' };
-    return { ok: true, txHash: found.hash, signerId: claim.signerId };
+    return { ok: true, txHash: found.hash, signerId: claim.signerId, txSigner: claim.txSigner };
   }
 
-  async function confirm(requirements: Requirements, txHash: string, signerId: string): Promise<string | undefined> {
+  async function confirm(requirements: Requirements, txHash: string, txSigner: string, tokenSender: string): Promise<string | undefined> {
     let view: NearTransferView;
     try {
-      view = await deps.readReceipt(txHash, signerId);
+      view = await deps.readReceipt(txHash, txSigner, tokenSender);
     } catch {
       return 'transfer is not final';
     }
-    return viewMatches(view, requirements, signerId, txHash);
+    return viewMatches(view, requirements, tokenSender, txHash);
   }
 
   return {
@@ -658,7 +669,7 @@ export function createNearSettler(deps: NearSettleDeps) {
       }
       const located = await locate(gated.requirements, gated.claim);
       if (!located.ok) return { isValid: false, invalidReason: located.reason };
-      const failed = await confirm(gated.requirements, located.txHash, located.signerId);
+      const failed = await confirm(gated.requirements, located.txHash, located.txSigner, located.signerId);
       if (failed) return { isValid: false, invalidReason: failed };
       return { isValid: true };
     },
@@ -694,7 +705,12 @@ export function createNearSettler(deps: NearSettleDeps) {
           if (lock) lock.status = 'failed';
           return { success: false, errorReason: 'relayer did not return a tx hash' };
         }
-        const failed = await confirm(gated.requirements, relayed.txHash, relayed.senderAccountId);
+        const failed = await confirm(
+          gated.requirements,
+          relayed.txHash,
+          relayed.senderAccountId,
+          gated.claim.delegate.senderId,
+        );
         if (failed) {
           if (lock) lock.status = 'failed';
           return { success: false, errorReason: failed };
@@ -711,7 +727,7 @@ export function createNearSettler(deps: NearSettleDeps) {
         return { success: false, errorReason: 'payment already used' };
       }
       if (prior) return { success: true, transaction: prior.txHash, replayed: true };
-      const failed = await confirm(gated.requirements, located.txHash, located.signerId);
+      const failed = await confirm(gated.requirements, located.txHash, located.txSigner, located.signerId);
       if (failed) return { success: false, errorReason: failed };
       return remember(gated.requirements, located.txHash, located.signerId);
     },

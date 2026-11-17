@@ -64,6 +64,7 @@ export type NearTransferView = {
 export type NearReceiptReader = (
   txHash: string,
   senderAccountId: string,
+  tokenSenderId?: string,
 ) => Promise<NearTransferView>;
 
 export type VerifyCode =
@@ -492,6 +493,7 @@ export async function readNearTestnetReceipt(
   txHash: string,
   senderAccountId: string,
   fetchFn: typeof fetch = fetch,
+  tokenSenderId = senderAccountId,
 ): Promise<NearTransferView> {
   const res = await fetchFn(NEAR_TESTNET_RPC, {
     method: 'POST',
@@ -509,5 +511,5 @@ export async function readNearTestnetReceipt(
   });
   const payload = (await res.json()) as { result?: unknown };
   if (!payload.result) throw new Error('tx_status missing result');
-  return transferFromTxStatus(payload.result, senderAccountId);
+  return transferFromTxStatus(payload.result, tokenSenderId);
 }

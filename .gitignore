@@ -8,6 +8,7 @@ node_modules/
 dist/
 coverage/
 *.log
+near-testnet-keys.json
 .DS_Store
 .lastmile-home/
 .grok/
