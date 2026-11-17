@@ -1,4 +1,4 @@
-import { b64decodeToString, b64encode, isHexAddress, normalizeAddress } from './bytes.js';
+import { b64decodeToString, b64encode, isHexAddress, isHexBytes32, normalizeAddress } from './bytes.js';
 import { fail } from './errors.js';
 import { usdToAtomic } from './money.js';
 import {
@@ -173,14 +173,70 @@ export function decodePayload(headerValue: string): PayloadBody {
   if (typeof parsed !== 'object' || parsed === null) {
     fail('x402_payload', 'payment payload is not an object', 402);
   }
-  const body = parsed as Partial<PayloadBody>;
+  const raw = parsed as Record<string, unknown>;
+  if (raw.x402Version === 2) return decodeV2Exact(raw);
+  const body = raw as Partial<PayloadBody>;
   if (body.x402Version !== 1 || typeof body.paymentId !== 'string' || typeof body.nonce !== 'string') {
     fail('x402_payload', 'payment payload missing paymentId/nonce', 402);
   }
   if (!body.accepted || typeof body.accepted !== 'object') {
     fail('x402_payload', 'payment payload missing accepted requirements', 402);
   }
+  rejectSplitAmount(body.accepted);
   return body as PayloadBody;
+}
+
+/** Standard x402 v2 exact (EIP-3009). paymentId is the authorization nonce, 1:1 with these signed bytes. */
+function decodeV2Exact(raw: Record<string, unknown>): PayloadBody {
+  const payload = asRecord(raw.payload);
+  const authorization = asRecord(payload?.authorization);
+  const nonce = typeof authorization?.nonce === 'string' ? authorization.nonce : '';
+  const signature = typeof payload?.signature === 'string' ? payload.signature : '';
+  if (!isHexBytes32(nonce) || !signature.startsWith('0x')) {
+    fail('x402_payload', 'payment payload missing paymentId/nonce', 402);
+  }
+  rejectSplitAmount(raw.accepted);
+  const accepted = asRequirements(raw.accepted);
+  if (!accepted) fail('x402_payload', 'payment payload missing accepted requirements', 402);
+  const from = typeof authorization?.from === 'string' ? authorization.from : '';
+  const to = typeof authorization?.to === 'string' ? authorization.to : '';
+  const value = authorization?.value == null ? '' : String(authorization.value);
+  if (!isHexAddress(from) || !isHexAddress(to) || !value) {
+    fail('x402_payload', 'payment payload missing paymentId/nonce', 402);
+  }
+  const claimed = asRecord(raw.accepted);
+  const claimedPayTo = typeof claimed?.payTo === 'string' ? claimed.payTo : accepted.payTo;
+  if (normalizeAddress(to) !== normalizeAddress(claimedPayTo)) {
+    fail('x402_payload', 'authorization does not match accepted payTo', 402);
+  }
+  return {
+    x402Version: 2,
+    paymentId: nonce,
+    nonce,
+    accepted,
+    eip3009: {
+      from: normalizeAddress(from),
+      to: normalizeAddress(to),
+      value,
+      validAfter: String(authorization?.validAfter ?? '0'),
+      validBefore: String(authorization?.validBefore ?? '0'),
+      nonce,
+      signature: signature as `0x${string}`,
+    },
+  };
+}
+
+function rejectSplitAmount(accepted: unknown): void {
+  const rec = asRecord(accepted);
+  if (!rec || rec.amount == null || rec.maxAmountRequired == null) return;
+  if (String(rec.amount) !== String(rec.maxAmountRequired)) {
+    fail('x402_payload', 'accepted amount and maxAmountRequired disagree', 402);
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  return value as Record<string, unknown>;
 }
 
 export function parseQuote(body: unknown, headers?: Headers): PaymentRequirements | undefined {

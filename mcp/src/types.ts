@@ -173,7 +173,7 @@ export type Eip3009Auth = {
 };
 
 export type PayloadBody = {
-  x402Version: 1;
+  x402Version: 1 | 2;
   paymentId: string;
   nonce: string;
   accepted: PaymentRequirements;

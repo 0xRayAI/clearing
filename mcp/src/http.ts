@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { handleBlip } from './blip.js';
+import { ClearingError } from './errors.js';
 import { handleExtract } from './extract.js';
 import { handleListed } from './listed.js';
 import { handlePin } from './pin.js';
@@ -80,7 +81,7 @@ export async function dispatch(req: IncomingMessage, res: ServerResponse, ctx: C
     const buf = Buffer.from(await response.arrayBuffer());
     res.end(buf);
   } catch (err) {
-    res.statusCode = 500;
+    res.statusCode = err instanceof ClearingError ? err.httpStatus : 500;
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify({ error: err instanceof Error ? err.message : 'extract failed' }));
   }

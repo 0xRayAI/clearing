@@ -43,12 +43,12 @@ function expectedShop(): PaymentRequirements {
   };
 }
 
-function paidHeader(): string {
+function paidHeader(paymentId = 'ping-cdp-1'): string {
   const req = expectedShop();
   return encodePayload({
     x402Version: 1,
-    paymentId: 'ping-cdp-1',
-    nonce: 'ping-cdp-1',
+    paymentId,
+    nonce: paymentId,
     accepted: req,
     eip3009: {
       from: FROM,
@@ -155,7 +155,7 @@ describe('CDP facilitator', () => {
         return new Response(JSON.stringify({ isValid: false, invalidReason: 'bad sig' }), { status: 200 });
       },
     });
-    const out = await rail.settle(paidHeader(), expectedShop());
+    const out = await rail.settle(paidHeader('ping-cdp-reject'), expectedShop());
     expect(out.ok).toBe(false);
     expect(out.error).toMatch(/bad sig/);
     expect(urls).toEqual(['https://api.cdp.coinbase.com/platform/v2/x402/verify']);
@@ -183,7 +183,7 @@ describe('CDP facilitator', () => {
           return new Response('no', { status: 404 });
         },
       });
-      const out = await rail.settle(paidHeader(), expectedShop());
+      const out = await rail.settle(paidHeader('ping-cdp-seller'), expectedShop());
       expect(out.ok).toBe(true);
       expect(out.txHash).toBe(TX);
       expect(urls).toEqual([
