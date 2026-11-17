@@ -1,77 +1,69 @@
-import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
+import { generateKeyPairSync } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { MemoryFacilitator } from '../mcp/src/facilitator.js';
-import {
-  VORTEX_TREASURY,
-  facilitatorPayToAllowlist,
-  handleFacilitator,
-  transferWithAuthorizationTypes,
-  usdcAuthDomain,
-} from '../mcp/src/facilitator-http.js';
-import { handleHangar } from '../mcp/src/http.js';
+import { CDP_VERIFY_URL, CDP_SETTLE_URL } from '../mcp/src/cdp-auth.js';
+import { VORTEX_TREASURY, facilitatorPayToAllowlist, handleFacilitator } from '../mcp/src/facilitator-http.js';
 import { USDC_BASE } from '../mcp/src/types.js';
 import { PAY_TO, makeCtx } from './helpers.js';
 
 const OTHER = '0x1111111111111111111111111111111111111111' as const;
-const NOW = 1_700_000_000n;
+const TX = `0x${'cd'.repeat(32)}`;
 
-async function signedBody(opts: {
-  payTo?: string;
-  to?: string;
-  value?: string;
-  amount?: string;
-  asset?: string;
-  validAfter?: string;
-  validBefore?: string;
-  from?: `0x${string}`;
-  signer?: `0x${string}`;
-}) {
-  const key = opts.signer ?? generatePrivateKey();
-  const account = privateKeyToAccount(key);
-  const from = opts.from ?? account.address;
-  const to = (opts.to ?? opts.payTo ?? VORTEX_TREASURY) as `0x${string}`;
-  const value = opts.value ?? '10000';
-  const validAfter = opts.validAfter ?? '0';
-  const validBefore = opts.validBefore ?? '9999999999';
-  const nonce = `0x${'ab'.repeat(32)}` as const;
-  const signature = await account.signTypedData({
-    domain: usdcAuthDomain(),
-    types: transferWithAuthorizationTypes,
-    primaryType: 'TransferWithAuthorization',
-    message: {
-      from,
-      to,
-      value: BigInt(value),
-      validAfter: BigInt(validAfter),
-      validBefore: BigInt(validBefore),
-      nonce,
-    },
+function ed25519Secret(): { id: string; secret: string } {
+  const { privateKey } = generateKeyPairSync('ed25519');
+  const jwk = privateKey.export({ format: 'jwk' });
+  if (!jwk.d || !jwk.x) throw new Error('ed25519 jwk missing d/x');
+  return {
+    id: '00000000-0000-4000-8000-000000000034',
+    secret: Buffer.concat([Buffer.from(jwk.d, 'base64url'), Buffer.from(jwk.x, 'base64url')]).toString('base64'),
+  };
+}
+
+function withCdpEnv(run: () => Promise<void>): Promise<void> {
+  const prevId = process.env.CDP_API_KEY_ID;
+  const prevSecret = process.env.CDP_API_KEY_SECRET;
+  const keys = ed25519Secret();
+  process.env.CDP_API_KEY_ID = keys.id;
+  process.env.CDP_API_KEY_SECRET = keys.secret;
+  return run().finally(() => {
+    if (prevId === undefined) delete process.env.CDP_API_KEY_ID;
+    else process.env.CDP_API_KEY_ID = prevId;
+    if (prevSecret === undefined) delete process.env.CDP_API_KEY_SECRET;
+    else process.env.CDP_API_KEY_SECRET = prevSecret;
   });
+}
+
+function body(payTo: string) {
   return {
     x402Version: 2,
     paymentPayload: {
       x402Version: 2,
       payload: {
-        signature,
-        authorization: { from, to, value, validAfter, validBefore, nonce },
+        signature: `0x${'aa'.repeat(65)}`,
+        authorization: {
+          from: '0x234a4B961908b20114980AF00c0974123763b48C',
+          to: payTo,
+          value: '10000',
+          validAfter: '0',
+          validBefore: '9999999999',
+          nonce: `0x${'ab'.repeat(32)}`,
+        },
       },
     },
     paymentRequirements: {
       scheme: 'exact',
       network: 'eip155:8453',
-      asset: opts.asset ?? USDC_BASE,
-      amount: opts.amount ?? '10000',
-      payTo: opts.payTo ?? VORTEX_TREASURY,
-      maxTimeoutSeconds: 60,
+      asset: USDC_BASE,
+      amount: '10000',
+      payTo,
     },
   };
 }
 
-function post(path: '/verify' | '/settle', body: unknown) {
+function post(path: '/verify' | '/settle', payload: unknown) {
   return new Request(`https://clearing.rippel.ai${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
   });
 }
 
@@ -90,66 +82,79 @@ describe('x402 facilitator routes', () => {
     }
   });
 
-  it('verifies a vortex payment and settles it once', async () => {
-    const facilitator = new MemoryFacilitator();
-    const ctx = makeCtx({}, { facilitator, config: { payTo: PAY_TO } });
-    const body = await signedBody({});
-    const verified = await handleFacilitator(post('/verify', body), ctx);
-    expect(verified?.status).toBe(200);
-    expect(await verified!.json()).toEqual({ isValid: true });
-    const settled = await handleHangar(post('/settle', body), ctx);
-    const paid = (await settled.json()) as { success: boolean; transaction?: string };
-    expect(paid.success).toBe(true);
-    expect(paid.transaction?.startsWith('0x')).toBe(true);
-    expect(facilitator.debitCount()).toBe(1);
-    const again = await handleFacilitator(post('/settle', body), ctx);
-    const replay = (await again!.json()) as { success: boolean };
-    expect(replay.success).toBe(true);
-    expect(facilitator.debitCount()).toBe(1);
-  });
-
-  it('rejects a signature that does not recover from', async () => {
-    const ctx = makeCtx();
-    const stranger = generatePrivateKey();
-    const body = await signedBody({ from: privateKeyToAccount(stranger).address });
-    const res = await handleFacilitator(post('/verify', body), ctx);
-    const verdict = (await res!.json()) as { isValid: boolean; invalidReason?: string };
-    expect(verdict.isValid).toBe(false);
-    expect(verdict.invalidReason).toMatch(/from/);
-  });
-
-  it('rejects value below amount, the wrong asset, a mismatched to, and a closed window', async () => {
-    const ctx = makeCtx();
-    const low = await signedBody({ value: '1', amount: '10000' });
-    const asset = await signedBody({ asset: OTHER });
-    const to = await signedBody({ to: OTHER });
-    const expired = await signedBody({ validAfter: '0', validBefore: '1' });
-    for (const body of [low, asset, to, expired]) {
-      const res = await handleFacilitator(post('/verify', body), ctx);
-      const verdict = (await res!.json()) as { isValid: boolean };
-      expect(verdict.isValid).toBe(false);
-    }
-  });
-
-  it('rejects a payTo outside the treasury allowlist and does not settle', async () => {
-    const facilitator = new MemoryFacilitator();
-    const ctx = makeCtx({}, { facilitator, config: { payTo: PAY_TO } });
-    const body = await signedBody({ payTo: OTHER, to: OTHER });
-    const verified = await handleFacilitator(post('/verify', body), ctx);
+  it('rejects a payTo outside the treasury allowlist and does not call CDP', async () => {
+    const urls: string[] = [];
+    const ctx = makeCtx({}, { config: { payTo: PAY_TO } });
+    const fetchFn = async (input: string | URL | Request) => {
+      urls.push(String(input));
+      return new Response('{}');
+    };
+    const verified = await handleFacilitator(post('/verify', body(OTHER)), ctx, { fetchFn });
     const verdict = (await verified!.json()) as { isValid: boolean; invalidReason?: string };
     expect(verdict.isValid).toBe(false);
     expect(verdict.invalidReason).toMatch(/treasury/);
-    const settled = await handleFacilitator(post('/settle', body), ctx);
+    const settled = await handleFacilitator(post('/settle', body(OTHER)), ctx, { fetchFn });
     const paid = (await settled!.json()) as { success: boolean; errorReason?: string };
     expect(paid.success).toBe(false);
     expect(paid.errorReason).toMatch(/treasury/);
-    expect(facilitator.debitCount()).toBe(0);
+    expect(urls).toEqual([]);
   });
 
-  it('accepts the configured CLEARING payTo', async () => {
-    const ctx = makeCtx({}, { config: { payTo: PAY_TO } });
-    const body = await signedBody({ payTo: PAY_TO, to: PAY_TO });
-    const res = await handleFacilitator(post('/verify', body), ctx);
-    expect(await res!.json()).toEqual({ isValid: true });
+  it('returns 503 when CDP keys are absent', async () => {
+    const prevId = process.env.CDP_API_KEY_ID;
+    const prevSecret = process.env.CDP_API_KEY_SECRET;
+    delete process.env.CDP_API_KEY_ID;
+    delete process.env.CDP_API_KEY_SECRET;
+    try {
+      const ctx = makeCtx({}, { config: { payTo: PAY_TO } });
+      const res = await handleFacilitator(post('/verify', body(VORTEX_TREASURY)), ctx);
+      expect(res?.status).toBe(503);
+      const err = (await res!.json()) as { error?: string };
+      expect(err.error).toMatch(/CDP_API_KEY_ID/);
+      expect(err.error).toMatch(/CDP_API_KEY_SECRET/);
+      expect(err.error).not.toMatch(/[A-Za-z0-9+/]{40,}/);
+    } finally {
+      if (prevId === undefined) delete process.env.CDP_API_KEY_ID;
+      else process.env.CDP_API_KEY_ID = prevId;
+      if (prevSecret === undefined) delete process.env.CDP_API_KEY_SECRET;
+      else process.env.CDP_API_KEY_SECRET = prevSecret;
+    }
+  });
+
+  it('passes the x402 body through to CDP verify, then settle only after verify', async () => {
+    await withCdpEnv(async () => {
+      const seen: Array<{ url: string; body: unknown }> = [];
+      const fetchFn = async (input: string | URL | Request, init?: RequestInit) => {
+        seen.push({ url: String(input), body: JSON.parse(String(init?.body ?? '{}')) });
+        if (String(input).endsWith('/verify')) return new Response(JSON.stringify({ isValid: true }));
+        return new Response(JSON.stringify({ success: true, transaction: TX }));
+      };
+      const ctx = makeCtx({}, { config: { payTo: PAY_TO } });
+      const payload = body(PAY_TO);
+      const verified = await handleFacilitator(post('/verify', payload), ctx, { fetchFn });
+      expect(await verified!.json()).toEqual({ isValid: true });
+      expect(seen.map((row) => row.url)).toEqual([CDP_VERIFY_URL]);
+      expect(seen[0]?.body).toEqual(payload);
+      const settled = await handleFacilitator(post('/settle', payload), ctx, { fetchFn });
+      expect(await settled.json()).toEqual({ success: true, transaction: TX });
+      expect(seen.map((row) => row.url)).toEqual([CDP_VERIFY_URL, CDP_VERIFY_URL, CDP_SETTLE_URL]);
+      expect(seen.some((row) => row.url.includes('zigzag'))).toBe(false);
+    });
+  });
+
+  it('does not settle when CDP verify rejects', async () => {
+    await withCdpEnv(async () => {
+      const urls: string[] = [];
+      const fetchFn = async (input: string | URL | Request) => {
+        urls.push(String(input));
+        return new Response(JSON.stringify({ isValid: false, invalidReason: 'bad sig' }));
+      };
+      const ctx = makeCtx({}, { config: { payTo: VORTEX_TREASURY } });
+      const settled = await handleFacilitator(post('/settle', body(VORTEX_TREASURY)), ctx, { fetchFn });
+      const paid = (await settled!.json()) as { success: boolean; errorReason?: string };
+      expect(paid.success).toBe(false);
+      expect(paid.errorReason).toBe('bad sig');
+      expect(urls).toEqual([CDP_VERIFY_URL]);
+    });
   });
 });
