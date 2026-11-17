@@ -4,7 +4,7 @@
  * This file never prints a key, a seed, or a mnemonic.
  */
 import { createHash, createPrivateKey, sign } from 'node:crypto';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { HOSTED_NEAR_PAYEES, handleFacilitator } from '../mcp/src/facilitator-http.js';
 import { CIRCLE_USDC_NEAR_TESTNET, NEAR_TESTNET_RPC, readNearTestnetReceipt } from '../mcp/src/near-rail.js';
@@ -238,10 +238,13 @@ describe.skipIf(!WALK)('NEAR testnet walk', () => {
     expect(await mainnet?.json()).toEqual({ isValid: false, invalidReason: 'mainnet cannot accept a testnet payee' });
     expect(HOSTED_NEAR_PAYEES).toContain(TREASURY);
 
-    const receipt = [
+    const receiptPath = new URL('../scripts/near-testnet-receipt.md', import.meta.url);
+    const header = [
       '# NEAR testnet walk',
       '',
       'Network: NEAR testnet. No mainnet call.',
+      '',
+      'Each walk is a new memo and its own relay. The in-process replay is a second settle of that same memo in the same process.',
       '',
       `| Role | Account |`,
       `| --- | --- |`,
@@ -249,21 +252,19 @@ describe.skipIf(!WALK)('NEAR testnet walk', () => {
       `| Payer | ${PAYER} |`,
       `| Relayer | ${TREASURY} |`,
       '',
-      `| Step | Tx |`,
-      `| --- | --- |`,
-      `| Account create, treasury | [2awFnLKQj9s1WV1LHwwJnJ6gVrcmT7HfMVPwqefkVT43](https://testnet.nearblocks.io/txns/2awFnLKQj9s1WV1LHwwJnJ6gVrcmT7HfMVPwqefkVT43) |`,
-      `| Account create, payer | [3uUdXH4Ckm1NbLEqf7FdrBZ7ksucPpFuhnqmmmh8s4gD](https://testnet.nearblocks.io/txns/3uUdXH4Ckm1NbLEqf7FdrBZ7ksucPpFuhnqmmmh8s4gD) |`,
-      `| USDC storage, payer | [4WRNHyo66k4WnQhwf9Y6E3fTPMNSdeG97PcMzQ1wqNCF](https://testnet.nearblocks.io/txns/4WRNHyo66k4WnQhwf9Y6E3fTPMNSdeG97PcMzQ1wqNCF) |`,
-      `| USDC storage, treasury | [Fm1dVnXhg8h7fgAkEXTFxmR53why632qa2oFxVWqNxz7](https://testnet.nearblocks.io/txns/Fm1dVnXhg8h7fgAkEXTFxmR53why632qa2oFxVWqNxz7) |`,
-      `| Circle faucet 20 USDC | [B47vXLavqFc5ib22oA8uN23WsmpnWkPv7p6C7cUk7jYa](https://testnet.nearblocks.io/txns/B47vXLavqFc5ib22oA8uN23WsmpnWkPv7p6C7cUk7jYa) |`,
-      `| Settle ft_transfer ${AMOUNT} memo ${memo} | [${settled.transaction}](https://testnet.nearblocks.io/txns/${settled.transaction}) |`,
+    ].join('\n');
+    const walk = [
+      `## Walk ${memo}`,
       '',
-      `Treasury USDC: ${beforeTreasury.toString()} -> ${afterTreasury.toString()}.`,
-      `Payer USDC: ${beforePayer.toString()} -> ${afterPayer.toString()}.`,
-      'Relay count: 1. A second settle returned the same hash and did not relay again.',
+      `Relay [${settled.transaction}](https://testnet.nearblocks.io/txns/${settled.transaction}) moved ${AMOUNT} testnet USDC.`,
+      `In-process replay held: the second settle of memo ${memo} returned ${settled.transaction} and the relay count stayed ${relays}.`,
+      `Treasury USDC before this relay: ${beforeTreasury.toString()}. After: ${afterTreasury.toString()}.`,
+      `Payer USDC before this relay: ${beforePayer.toString()}. After: ${afterPayer.toString()}.`,
       '',
     ].join('\n');
-    writeFileSync(new URL('../scripts/near-testnet-receipt.md', import.meta.url), receipt);
+    const prior = existsSync(receiptPath) ? readFileSync(receiptPath, 'utf8') : '';
+    const receipt = prior.includes(`## Walk ${memo}`) ? prior : (prior.startsWith('# NEAR testnet walk') ? `${prior.trim()}\n\n${walk}` : `${header}\n${walk}`);
+    writeFileSync(receiptPath, receipt);
     expect(redact(receipt).includes('ed25519:')).toBe(false);
   }, 180_000);
 });
