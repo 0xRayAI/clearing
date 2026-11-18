@@ -3,9 +3,9 @@
 //! near-workspaces 0.24: https://docs.rs/near-workspaces/0.24.0
 use clearing_escrow::{signed_message, MIN_AMOUNT};
 use ed25519_dalek::{Signer, SigningKey};
+use near_workspaces::network::Sandbox;
 use near_workspaces::types::{Gas, NearToken};
 use near_workspaces::{Account, AccountId, Contract, Worker};
-use near_workspaces::network::Sandbox;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::path::PathBuf;
@@ -24,7 +24,10 @@ struct Key {
 fn key(fill: u8) -> Key {
     let secret = [fill; 32];
     let signing = SigningKey::from_bytes(&secret);
-    Key { secret, public_hex: hex_encode(signing.verifying_key().as_bytes()) }
+    Key {
+        secret,
+        public_hex: hex_encode(signing.verifying_key().as_bytes()),
+    }
 }
 
 fn sign(key: &Key, message: &str) -> String {
@@ -73,13 +76,26 @@ fn manifest(rel: &str) -> String {
 
 fn escrow_wasm() -> &'static [u8] {
     static WASM: OnceLock<Vec<u8>> = OnceLock::new();
-    WASM.get_or_init(|| build_wasm(&manifest("Cargo.toml"), "clearing_escrow", Some("sandbox-token")))
-        .as_slice()
+    WASM.get_or_init(|| {
+        build_wasm(
+            &manifest("Cargo.toml"),
+            "clearing_escrow",
+            Some("sandbox-token"),
+        )
+    })
+    .as_slice()
 }
 
 fn token_wasm() -> &'static [u8] {
     static WASM: OnceLock<Vec<u8>> = OnceLock::new();
-    WASM.get_or_init(|| build_wasm(&manifest("tests/ft/Cargo.toml"), "clearing_escrow_token", None)).as_slice()
+    WASM.get_or_init(|| {
+        build_wasm(
+            &manifest("tests/ft/Cargo.toml"),
+            "clearing_escrow_token",
+            None,
+        )
+    })
+    .as_slice()
 }
 
 struct Rig {
@@ -96,7 +112,10 @@ struct Rig {
 async fn rig() -> Rig {
     let worker = near_workspaces::sandbox().await.expect("sandbox");
     let token = worker.dev_deploy(token_wasm()).await.expect("deploy token");
-    let escrow = worker.dev_deploy(escrow_wasm()).await.expect("deploy escrow");
+    let escrow = worker
+        .dev_deploy(escrow_wasm())
+        .await
+        .expect("deploy escrow");
     let buyer = worker.dev_create_account().await.expect("buyer");
     let creator = worker.dev_create_account().await.expect("creator");
     let arbiter = worker.dev_create_account().await.expect("arbiter");
@@ -119,7 +138,12 @@ async fn rig() -> Rig {
             .expect("init call"),
     );
     must(
-        token.call("new").gas(Gas::from_tgas(50)).transact().await.expect("token init"),
+        token
+            .call("new")
+            .gas(Gas::from_tgas(50))
+            .transact()
+            .await
+            .expect("token init"),
     );
     register(&buyer, &token, buyer.id()).await;
     register(&buyer, &token, escrow.id()).await;
@@ -132,7 +156,16 @@ async fn rig() -> Rig {
             .await
             .expect("mint"),
     );
-    Rig { worker, token, escrow, buyer, creator, arbiter, creator_key, client_key }
+    Rig {
+        worker,
+        token,
+        escrow,
+        buyer,
+        creator,
+        arbiter,
+        creator_key,
+        client_key,
+    }
 }
 
 async fn register(payer: &Account, token: &Contract, account: &AccountId) {
@@ -196,29 +229,77 @@ async fn escrow_balance(escrow: &Contract, account: &AccountId) -> u128 {
     value.as_str().expect("u128 string").parse().unwrap()
 }
 
-fn payload(client_pk: &str, price: u128, deliver: u64, review: u64, dispute: u64, fund: u64) -> String {
+fn payload(
+    client_pk: &str,
+    price: u128,
+    deliver: u64,
+    review: u64,
+    dispute: u64,
+    fund: u64,
+) -> String {
     format!(
         r#"{{"client_pk":"{client_pk}","price":"{price}","deliver_ns":{deliver},"review_ns":{review},"dispute_ns":{dispute},"fund_ns":{fund}}}"#
     )
 }
 
-async fn open_and_fund(rig: &Rig, price: u128, deliver: u64, review: u64, dispute: u64, fund: u64) -> u64 {
-    let body = payload(&rig.client_key.public_hex, price, deliver, review, dispute, fund);
+async fn open_and_fund(
+    rig: &Rig,
+    price: u128,
+    deliver: u64,
+    review: u64,
+    dispute: u64,
+    fund: u64,
+) -> u64 {
+    let body = payload(
+        &rig.client_key.public_hex,
+        price,
+        deliver,
+        review,
+        dispute,
+        fund,
+    );
     let nonce = format!("open{:016}", price);
     let signature = sign(
         &rig.creator_key,
-        &signed_message("testnet", rig.escrow.id().as_str(), 0, "open", &nonce, &body),
+        &signed_message(
+            "testnet",
+            rig.escrow.id().as_str(),
+            0,
+            "open",
+            &nonce,
+            &body,
+        ),
     );
     let id: u64 = must_json(
         rig.buyer
             .call(rig.escrow.id(), "open")
             .args_json(json!({ "payload": body, "nonce": nonce, "signature": signature }))
+            .deposit(NearToken::from_near(1))
             .gas(Gas::from_tgas(80))
             .transact()
             .await
             .expect("open"),
     );
-    pay(rig, id, price.to_string(), format!(r#"{{"deal_id":{id}}}"#)).await;
+    let fund_nonce = format!("fund{:020}", id);
+    let payer = rig.buyer.id().as_str();
+    let fund_sig = sign(
+        &rig.client_key,
+        &signed_message(
+            "testnet",
+            rig.escrow.id().as_str(),
+            id,
+            "fund",
+            &fund_nonce,
+            payer,
+        ),
+    );
+    let msg = serde_json::json!({
+        "deal_id": id,
+        "nonce": fund_nonce,
+        "signature": fund_sig,
+    })
+    .to_string();
+    pay(rig, id, price.to_string(), msg).await;
     id
 }
 
@@ -241,7 +322,11 @@ async fn pay(rig: &Rig, _id: u64, amount: String, msg: String) {
 }
 
 fn must_json<T: DeserializeOwned>(outcome: near_workspaces::result::ExecutionFinalResult) -> T {
-    assert!(outcome.is_success(), "call failed: {:?}", outcome.failures());
+    assert!(
+        outcome.is_success(),
+        "call failed: {:?}",
+        outcome.failures()
+    );
     outcome.json().expect("json result")
 }
 
@@ -250,7 +335,14 @@ async fn deliver(rig: &Rig, deal_id: u64) {
     let nonce = format!("deliver{:020}", deal_id);
     let signature = sign(
         &rig.creator_key,
-        &signed_message("testnet", rig.escrow.id().as_str(), deal_id, "deliver", &nonce, payload),
+        &signed_message(
+            "testnet",
+            rig.escrow.id().as_str(),
+            deal_id,
+            "deliver",
+            &nonce,
+            payload,
+        ),
     );
     must(
         rig.buyer
@@ -272,7 +364,14 @@ async fn accept(rig: &Rig, deal_id: u64) {
     let nonce = format!("accept{:020}", deal_id);
     let signature = sign(
         &rig.client_key,
-        &signed_message("testnet", rig.escrow.id().as_str(), deal_id, "accept", &nonce, ""),
+        &signed_message(
+            "testnet",
+            rig.escrow.id().as_str(),
+            deal_id,
+            "accept",
+            &nonce,
+            "",
+        ),
     );
     must(
         rig.buyer
@@ -289,7 +388,14 @@ async fn dispute(rig: &Rig, deal_id: u64) {
     let nonce = format!("dispute{:020}", deal_id);
     let signature = sign(
         &rig.client_key,
-        &signed_message("testnet", rig.escrow.id().as_str(), deal_id, "dispute", &nonce, ""),
+        &signed_message(
+            "testnet",
+            rig.escrow.id().as_str(),
+            deal_id,
+            "dispute",
+            &nonce,
+            "",
+        ),
     );
     must(
         rig.buyer
@@ -313,8 +419,19 @@ async fn bad_msg_refunds_full_amount() {
 #[tokio::test]
 async fn wrong_token_refunds() {
     let rig = rig().await;
-    let other = rig.worker.dev_deploy(token_wasm()).await.expect("other token");
-    must(other.call("new").gas(Gas::from_tgas(50)).transact().await.expect("other init"));
+    let other = rig
+        .worker
+        .dev_deploy(token_wasm())
+        .await
+        .expect("other token");
+    must(
+        other
+            .call("new")
+            .gas(Gas::from_tgas(50))
+            .transact()
+            .await
+            .expect("other init"),
+    );
     register(&rig.buyer, &other, rig.buyer.id()).await;
     register(&rig.buyer, &other, rig.escrow.id()).await;
     must(
@@ -348,7 +465,13 @@ async fn wrong_token_refunds() {
 async fn below_min_amount_rejected() {
     let rig = rig().await;
     let before = balance(&rig.token, rig.buyer.id()).await;
-    pay(&rig, 0, "999999".to_string(), r#"{"deal_id":1}"#.to_string()).await;
+    pay(
+        &rig,
+        0,
+        "999999".to_string(),
+        r#"{"deal_id":1}"#.to_string(),
+    )
+    .await;
     assert_eq!(balance(&rig.token, rig.buyer.id()).await, before);
 }
 
@@ -357,11 +480,17 @@ async fn deal_release_on_client_accept() {
     let rig = rig().await;
     let before = balance(&rig.token, rig.buyer.id()).await;
     let id = open_and_fund(&rig, MIN_AMOUNT, LONG, LONG, LONG, LONG).await;
-    assert_eq!(balance(&rig.token, rig.buyer.id()).await, before - MIN_AMOUNT);
+    assert_eq!(
+        balance(&rig.token, rig.buyer.id()).await,
+        before - MIN_AMOUNT
+    );
     deliver(&rig, id).await;
     accept(&rig, id).await;
     assert_eq!(deal_state(&rig.escrow, id).await, "Released");
-    assert_eq!(escrow_balance(&rig.escrow, rig.creator.id()).await, MIN_AMOUNT);
+    assert_eq!(
+        escrow_balance(&rig.escrow, rig.creator.id()).await,
+        MIN_AMOUNT
+    );
     let fee: u16 = rig
         .escrow
         .view("get_fee_bps")
@@ -388,7 +517,10 @@ async fn deal_release_after_review_timeout() {
             .expect("release"),
     );
     assert_eq!(deal_state(&rig.escrow, id).await, "Released");
-    assert_eq!(escrow_balance(&rig.escrow, rig.creator.id()).await, MIN_AMOUNT);
+    assert_eq!(
+        escrow_balance(&rig.escrow, rig.creator.id()).await,
+        MIN_AMOUNT
+    );
 }
 
 #[tokio::test]
@@ -401,6 +533,7 @@ async fn dispute_resolved_by_arbiter() {
         rig.arbiter
             .call(rig.escrow.id(), "resolve_dispute")
             .args_json(json!({ "deal_id": id, "creator_bps": 7000 }))
+            .deposit(NearToken::from_yoctonear(1))
             .gas(Gas::from_tgas(50))
             .transact()
             .await
@@ -437,14 +570,82 @@ async fn failed_withdraw_puts_the_balance_back() {
     let id = open_and_fund(&rig, MIN_AMOUNT, LONG, LONG, LONG, LONG).await;
     deliver(&rig, id).await;
     accept(&rig, id).await;
-    assert_eq!(escrow_balance(&rig.escrow, rig.creator.id()).await, MIN_AMOUNT);
+    assert_eq!(
+        escrow_balance(&rig.escrow, rig.creator.id()).await,
+        MIN_AMOUNT
+    );
     let outcome = rig
         .creator
         .call(rig.escrow.id(), "withdraw")
+        .deposit(NearToken::from_yoctonear(1))
         .gas(Gas::from_tgas(100))
         .transact()
         .await
         .expect("withdraw submitted");
-    assert!(!outcome.receipt_failures().is_empty(), "ft_transfer should fail for an unregistered creator");
-    assert_eq!(escrow_balance(&rig.escrow, rig.creator.id()).await, MIN_AMOUNT);
+    assert!(
+        !outcome.receipt_failures().is_empty(),
+        "ft_transfer should fail for an unregistered creator"
+    );
+    assert_eq!(
+        escrow_balance(&rig.escrow, rig.creator.id()).await,
+        MIN_AMOUNT
+    );
+}
+
+#[tokio::test]
+async fn plain_ft_transfer_does_not_credit_a_deal() {
+    let rig = rig().await;
+    let body = payload(
+        &rig.client_key.public_hex,
+        MIN_AMOUNT,
+        LONG,
+        LONG,
+        LONG,
+        LONG,
+    );
+    let nonce = format!("open{:016}", MIN_AMOUNT);
+    let signature = sign(
+        &rig.creator_key,
+        &signed_message(
+            "testnet",
+            rig.escrow.id().as_str(),
+            0,
+            "open",
+            &nonce,
+            &body,
+        ),
+    );
+    let id: u64 = must_json(
+        rig.buyer
+            .call(rig.escrow.id(), "open")
+            .args_json(json!({ "payload": body, "nonce": nonce, "signature": signature }))
+            .deposit(NearToken::from_near(1))
+            .gas(Gas::from_tgas(80))
+            .transact()
+            .await
+            .expect("open"),
+    );
+    let before = balance(&rig.token, rig.buyer.id()).await;
+    must(
+        rig.buyer
+            .call(rig.token.id(), "ft_transfer")
+            .args_json(json!({
+                "receiver_id": rig.escrow.id(),
+                "amount": MIN_AMOUNT.to_string(),
+                "memo": null,
+            }))
+            .deposit(NearToken::from_yoctonear(1))
+            .gas(Gas::from_tgas(50))
+            .transact()
+            .await
+            .expect("plain ft_transfer"),
+    );
+    assert_eq!(
+        balance(&rig.token, rig.buyer.id()).await,
+        before - MIN_AMOUNT
+    );
+    assert_eq!(balance(&rig.token, rig.escrow.id()).await, MIN_AMOUNT);
+    assert_eq!(deal_state(&rig.escrow, id).await, "Created");
+    assert_eq!(escrow_balance(&rig.escrow, rig.buyer.id()).await, 0);
+    assert_eq!(escrow_balance(&rig.escrow, rig.creator.id()).await, 0);
 }
