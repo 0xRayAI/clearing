@@ -23,7 +23,7 @@
 //! - NEP-141 refund: https://nomicon.io/Standards/Tokens/FungibleToken/Core
 //! - `ft_transfer` attaches 1 yoctoNEAR: https://docs.near.org/primitives/ft
 //!
-//! Init accepts only Circle USDC on NEAR testnet.
+//! Init accepts Circle USDC on NEAR testnet or mainnet.
 #![deny(unused)]
 
 use near_sdk::json_types::U128;
@@ -37,6 +37,10 @@ use near_sdk::{
 /// Circle USDC on NEAR testnet (ft_metadata: symbol USDC, decimals 6).
 pub const CIRCLE_USDC_NEAR_TESTNET: &str =
     "3e2210e1184b45b64c8a434c0a7e7b23cc04ea7eb7a6c3c32520d03d4afcb8af";
+
+/// Circle USDC on NEAR mainnet (ft_metadata: symbol USDC, decimals 6).
+pub const CIRCLE_USDC_NEAR_MAINNET: &str =
+    "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1";
 
 /// Every signed string starts with this. The rest is chain, contract, deal,
 /// action, nonce, and the exact payload.
@@ -153,8 +157,9 @@ pub fn signed_message(
 
 #[near]
 impl Escrow {
-    /// `token_id` must be Circle USDC on testnet. `creator_pk` is the foundry
-    /// ed25519 key (64 hex chars). `fee_bps` is not a parameter: it is 0.
+    /// `token_id` must be Circle USDC on NEAR testnet or mainnet. `creator_pk`
+    /// is the foundry ed25519 key (64 hex chars). `fee_bps` is not a parameter:
+    /// it is 0.
     #[init]
     pub fn new(
         token_id: AccountId,
@@ -165,8 +170,10 @@ impl Escrow {
         min_window_ns: u64,
     ) -> Self {
         require!(
-            cfg!(feature = "sandbox-token") || token_id.as_str() == CIRCLE_USDC_NEAR_TESTNET,
-            "token_id must be Circle USDC on NEAR testnet"
+            cfg!(feature = "sandbox-token")
+                || token_id.as_str() == CIRCLE_USDC_NEAR_TESTNET
+                || token_id.as_str() == CIRCLE_USDC_NEAR_MAINNET,
+            "token_id must be Circle USDC on NEAR testnet or mainnet"
         );
         require!(
             arbiter_id != token_id && creator_id != token_id && arbiter_id != creator_id,
@@ -713,6 +720,21 @@ mod tests {
             );
         });
         assert!(caught.is_err());
+    }
+
+    #[test]
+    fn init_accepts_circle_usdc_on_near_mainnet() {
+        set_caller(arbiter(), 0);
+        let escrow = Escrow::new(
+            CIRCLE_USDC_NEAR_MAINNET.parse().unwrap(),
+            arbiter(),
+            creator(),
+            key(1).public_hex,
+            "mainnet".into(),
+            WINDOW,
+        );
+        assert_eq!(escrow.get_token_id().as_str(), CIRCLE_USDC_NEAR_MAINNET);
+        assert_eq!(escrow.get_chain_id(), "mainnet");
     }
 
     #[test]
