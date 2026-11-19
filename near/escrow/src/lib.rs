@@ -75,7 +75,6 @@ enum Prefix {
     Deals,
     Balances,
     Used,
-    Pending,
 }
 
 #[near(serializers = [borsh, json])]
@@ -164,8 +163,8 @@ pub struct Escrow {
     balances: LookupMap<AccountId, u128>,
     /// `deal|action|nonce` already accepted.
     used: LookupSet<String>,
-    /// Debited withdraws whose callback has not finished.
-    pending: LookupMap<AccountId, Pending>,
+    /// The one debited withdraw whose callback has not finished.
+    pending: Option<Pending>,
     /// Token units this contract still owes: balances, open deals, and pending withdraws.
     accounted: u128,
 }
@@ -235,7 +234,7 @@ impl Escrow {
             deals: LookupMap::new(Prefix::Deals),
             balances: LookupMap::new(Prefix::Balances),
             used: LookupSet::new(Prefix::Used),
-            pending: LookupMap::new(Prefix::Pending),
+            pending: None,
             accounted: 0,
         }
     }
@@ -553,16 +552,13 @@ impl Escrow {
         let caller = env::predecessor_account_id();
         let amount = self.balances.get(&caller).copied().unwrap_or(0);
         require!(amount > 0, "nothing to withdraw");
-        require!(self.pending.get(&caller).is_none(), "withdraw in flight");
+        require!(self.pending.is_none(), "withdraw in flight");
         self.balances.remove(&caller);
-        self.pending.insert(
-            caller.clone(),
-            Pending {
-                account: caller.clone(),
-                amount,
-                stage: PendingStage::Outgoing,
-            },
-        );
+        self.pending = Some(Pending {
+            account: caller.clone(),
+            amount,
+            stage: PendingStage::Outgoing,
+        });
         ext_ft::ext(self.token_id.clone())
             .with_attached_deposit(ONE_YOCTO)
             .with_static_gas(GAS_FT_TRANSFER)
@@ -582,7 +578,7 @@ impl Escrow {
     /// A missing pending, or a settle already in progress, is left alone.
     #[private]
     pub fn on_withdraw_resolve(&mut self, account_id: AccountId, amount: U128) {
-        let Some(pending) = self.pending.get(&account_id).cloned() else {
+        let Some(pending) = self.pending.clone() else {
             return;
         };
         if pending.stage != PendingStage::Outgoing
@@ -592,13 +588,13 @@ impl Escrow {
             return;
         }
         let ok = matches!(env::promise_result(0), PromiseResult::Successful(_));
-        self.pending.remove(&account_id);
+        self.pending = None;
         if ok {
             self.accounted = self.accounted.saturating_sub(pending.amount);
             return;
         }
         if !self.restore(&account_id, pending.amount) {
-            self.pending.insert(account_id, pending);
+            self.pending = Some(pending);
         }
     }
 
@@ -613,7 +609,11 @@ impl Escrow {
             "attach at least 50 TGas"
         );
         let caller = env::predecessor_account_id();
-        let Some(mut pending) = self.pending.get(&caller).cloned() else {
+        let Some(mut pending) = self
+            .pending
+            .clone()
+            .filter(|pending| pending.account == caller)
+        else {
             env::panic_str("nothing pending");
         };
         require!(
@@ -622,7 +622,7 @@ impl Escrow {
         );
         require!(pending.account == caller, "pending account mismatch");
         pending.stage = PendingStage::Settling;
-        self.pending.insert(caller.clone(), pending);
+        self.pending = Some(pending);
         ext_ft::ext(self.token_id.clone())
             .with_static_gas(GAS_FT_BALANCE)
             .ft_balance_of(env::current_account_id())
@@ -634,9 +634,14 @@ impl Escrow {
     }
 
     /// Applies `settle` once. A failed balance read puts the pending back.
+    /// One withdraw is in flight, so this amount is the only shortfall match.
     #[private]
     pub fn on_settle(&mut self, account_id: AccountId) {
-        let Some(pending) = self.pending.get(&account_id).cloned() else {
+        let Some(pending) = self
+            .pending
+            .clone()
+            .filter(|pending| pending.account == account_id)
+        else {
             return;
         };
         if pending.stage != PendingStage::Settling || pending.account != account_id {
@@ -662,7 +667,7 @@ impl Escrow {
             self.reopen_pending(account_id, pending);
             return;
         }
-        self.pending.remove(&account_id);
+        self.pending = None;
         if shortfall == 0 {
             if !self.restore(&account_id, pending.amount) {
                 self.reopen_pending(account_id, pending);
@@ -677,7 +682,9 @@ impl Escrow {
     }
 
     pub fn get_pending(&self, account_id: AccountId) -> Option<Pending> {
-        self.pending.get(&account_id).cloned()
+        self.pending
+            .clone()
+            .filter(|pending| pending.account == account_id)
     }
 
     pub fn get_deal(&self, deal_id: u64) -> Option<Deal> {
@@ -862,8 +869,11 @@ impl Escrow {
     }
 
     fn reopen_pending(&mut self, account_id: AccountId, mut pending: Pending) {
+        if pending.account != account_id {
+            return;
+        }
         pending.stage = PendingStage::Outgoing;
-        self.pending.insert(account_id, pending);
+        self.pending = Some(pending);
     }
 
     fn credit(&mut self, account: &AccountId, amount: u128) {
@@ -1581,5 +1591,65 @@ mod tests {
         set_callback(42, balance_result(PRICE));
         escrow.on_settle(creator());
         assert_eq!(escrow.get_balance(creator()).0, 0);
+    }
+
+    #[test]
+    fn withdraw_rejects_a_zero_deposit() {
+        let mut escrow = contract();
+        let payload = open_payload(&key(2), PRICE);
+        open_deal(&mut escrow, &payload, "nonceopen00000001");
+        fund(&mut escrow, 1, PRICE, 1);
+        deliver(&mut escrow, 1, 10, "noncedeliver000001");
+        accept(&mut escrow, 1, 20, "nonceaccept0000001");
+        set_caller(creator(), 30);
+        let rejected = catch_unwind(AssertUnwindSafe(|| escrow.withdraw()));
+        assert!(rejected.is_err());
+        assert_eq!(escrow.get_balance(creator()).0, PRICE);
+        assert!(escrow.get_pending(creator()).is_none());
+        assert_eq!(escrow.accounted, PRICE);
+    }
+
+    #[test]
+    fn a_second_withdraw_is_rejected_while_one_is_pending() {
+        let mut escrow = contract();
+        let payload = open_payload(&key(2), PRICE);
+        open_deal(&mut escrow, &payload, "nonceopen00000001");
+        fund(&mut escrow, 1, PRICE, 1);
+        let nonce = "noncesettle0000001";
+        let body = "5000";
+        let creator_sig = sign(&key(1), &message(1, "settle", nonce, body));
+        let client_sig = sign(&key(2), &message(1, "settle", nonce, body));
+        set_caller("anyone.testnet".parse().unwrap(), 10);
+        escrow.settle(1, nonce.to_string(), 5_000, creator_sig, client_sig);
+        assert_eq!(escrow.get_balance(creator()).0, 500_000);
+        assert_eq!(escrow.get_balance(client()).0, 500_000);
+
+        set_caller_deposit(creator(), 20, ONE_YOCTO);
+        let _creator = escrow.withdraw();
+        assert_eq!(escrow.get_balance(creator()).0, 0);
+        assert_eq!(escrow.get_pending(creator()).expect("pending").amount, 500_000);
+
+        set_caller_deposit(client(), 21, ONE_YOCTO);
+        let blocked = catch_unwind(AssertUnwindSafe(|| escrow.withdraw()));
+        assert!(blocked.is_err());
+        assert_eq!(escrow.get_balance(client()).0, 500_000);
+        assert!(escrow.get_pending(client()).is_none());
+        assert_eq!(escrow.get_pending(creator()).expect("pending").amount, 500_000);
+        assert_eq!(escrow.accounted, PRICE);
+
+        set_caller_deposit(creator(), 30, ONE_YOCTO);
+        let _settle = escrow.settle_pending();
+        set_callback(31, balance_result(500_000));
+        escrow.on_settle(creator());
+        assert!(escrow.get_pending(creator()).is_none());
+        assert_eq!(escrow.get_balance(creator()).0, 0);
+        assert_eq!(escrow.accounted, 500_000);
+        assert_eq!(escrow.get_balance(client()).0, 500_000);
+
+        set_caller_deposit(client(), 40, ONE_YOCTO);
+        let _client = escrow.withdraw();
+        assert_eq!(escrow.get_balance(client()).0, 0);
+        assert_eq!(escrow.get_pending(client()).expect("pending").amount, 500_000);
+        assert!(escrow.get_pending(creator()).is_none());
     }
 }

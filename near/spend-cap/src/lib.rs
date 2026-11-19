@@ -1161,4 +1161,109 @@ mod tests {
         assert!(again.is_err());
         assert_eq!(spend.get_withdraw_inflight().0, 0);
     }
+
+    #[test]
+    fn confirm_rejects_a_zero_deposit() {
+        let mut spend = vault_with_approval();
+        set_owner(1);
+        let result = spend.pay(shop(), U128(150), "nonce-confirm-deposit".to_string());
+        let PromiseOrValue::Value(id) = result else {
+            panic!("approval id");
+        };
+        set_owner(2);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            spend.confirm(id.0 as u64);
+        }));
+        assert!(caught.is_err());
+        assert_eq!(spend.get_open_approvals(), 1);
+        assert_eq!(spend.get_reserved().0, 0);
+        assert!(spend.pay_pending.is_none());
+    }
+
+    #[test]
+    fn reject_rejects_a_zero_deposit() {
+        let mut spend = vault_with_approval();
+        set_owner(1);
+        let result = spend.pay(shop(), U128(150), "nonce-reject-deposit".to_string());
+        let PromiseOrValue::Value(_) = result else {
+            panic!("approval id");
+        };
+        set_owner(2);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            spend.reject(1);
+        }));
+        assert!(caught.is_err());
+        assert_eq!(spend.get_open_approvals(), 1);
+        assert_eq!(spend.get_reserved().0, 0);
+        assert!(spend.pay_pending.is_none());
+    }
+
+    #[test]
+    fn set_allow_rejects_a_zero_deposit() {
+        let mut spend = open_vault();
+        set_owner(1);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            spend.set_allow(vec![shop()]);
+        }));
+        assert!(caught.is_err());
+        assert!(spend.allow.is_empty());
+    }
+
+    #[test]
+    fn set_deny_rejects_a_zero_deposit() {
+        let mut spend = open_vault();
+        set_owner(1);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            spend.set_deny(vec![shop()]);
+        }));
+        assert!(caught.is_err());
+        assert!(spend.deny.is_empty());
+    }
+
+    #[test]
+    fn add_agent_key_rejects_a_zero_deposit() {
+        let mut spend = open_vault();
+        set_owner(1);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            spend.add_agent_key(ed25519_key(7));
+        }));
+        assert!(caught.is_err());
+        assert!(spend.agent_pk.is_none());
+    }
+
+    #[test]
+    fn settle_counts_a_stuck_pay_without_a_second_transfer() {
+        let mut spend = open_vault();
+        set_owner(1);
+        let first = spend.pay(shop(), U128(400_000), "nonce-stuck-pay".to_string());
+        assert!(matches!(first, PromiseOrValue::Promise(_)));
+        assert_eq!(spend.get_reserved().0, 400_000);
+        assert_eq!(spend.get_spent().0, 0);
+        assert_eq!(
+            spend.pay_pending.as_ref().unwrap().stage,
+            PendingStage::Outgoing
+        );
+        set_owner_deposit(2, ONE_YOCTO);
+        let _settle = spend.settle();
+        assert_eq!(
+            spend.pay_pending.as_ref().unwrap().stage,
+            PendingStage::Settling
+        );
+        assert_eq!(spend.get_reserved().0, 400_000);
+        assert_eq!(spend.get_spent().0, 0);
+        callback_env(vec![balance_result(1_000)]);
+        spend.on_settle();
+        assert!(spend.pay_pending.is_none());
+        assert!(spend.withdraw_pending.is_none());
+        assert_eq!(spend.get_reserved().0, 0);
+        assert_eq!(spend.get_spent().0, 400_000);
+        assert_eq!(spend.get_withdraw_inflight().0, 0);
+        set_owner_deposit(3, ONE_YOCTO);
+        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            spend.settle();
+        }));
+        assert!(again.is_err());
+        assert_eq!(spend.get_spent().0, 400_000);
+        assert_eq!(spend.get_reserved().0, 0);
+    }
 }
