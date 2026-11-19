@@ -340,15 +340,21 @@ impl SpendVault {
 
     /// `balance - reserved - inflight` is what a withdraw may take.
     /// In-flight pays still sit on this vault until `on_paid`.
+    /// A failed or unreadable balance read returns before any hold.
     #[private]
-    pub fn on_withdraw_check(&mut self, receiver_id: AccountId, amount: U128) -> Promise {
+    pub fn on_withdraw_check(
+        &mut self,
+        receiver_id: AccountId,
+        amount: U128,
+    ) -> PromiseOrValue<()> {
         let balance = match env::promise_result(0) {
             PromiseResult::Successful(bytes) => {
-                near_sdk::serde_json::from_slice::<U128>(&bytes)
-                    .unwrap_or_else(|_| env::panic_str("bad balance"))
-                    .0
+                match near_sdk::serde_json::from_slice::<U128>(&bytes) {
+                    Ok(value) => value.0,
+                    Err(_) => return PromiseOrValue::Value(()),
+                }
             }
-            _ => env::panic_str("balance lookup failed"),
+            _ => return PromiseOrValue::Value(()),
         };
         let held = self.reserved.saturating_add(self.withdraw_inflight);
         let available = balance.saturating_sub(held);
@@ -365,7 +371,7 @@ impl SpendVault {
             noted_balance: Some(balance),
         });
         let register = self.allow.iter().any(|id| id == &receiver_id);
-        self.transfer_out(
+        PromiseOrValue::Promise(self.transfer_out(
             receiver_id,
             amount.0,
             Some("owner-withdraw".to_string()),
@@ -373,7 +379,7 @@ impl SpendVault {
             Self::ext(env::current_account_id())
                 .with_static_gas(GAS_ON_PAID)
                 .on_withdraw(U128(amount.0)),
-        )
+        ))
     }
 
     /// The token keeps the vault's balance when `ft_transfer` fails.
@@ -918,6 +924,28 @@ mod tests {
         assert_eq!(spend.get_withdraw_inflight().0, 0);
         assert_eq!(spend.get_spent().0, 0);
         assert!(spend.withdraw_pending.is_none());
+    }
+
+    #[test]
+    fn a_failed_balance_lookup_does_not_hold_or_transfer() {
+        let mut spend = open_vault();
+        let before = spend.get_withdraw_inflight().0;
+        callback_env(vec![PromiseResult::Failed]);
+        let result = spend.on_withdraw_check(shop(), U128(50));
+        assert!(matches!(result, PromiseOrValue::Value(())));
+        assert!(spend.withdraw_pending.is_none());
+        assert_eq!(spend.get_withdraw_inflight().0, before);
+    }
+
+    #[test]
+    fn a_balance_body_that_is_not_a_u128_does_not_hold_or_transfer() {
+        let mut spend = open_vault();
+        let before = spend.get_withdraw_inflight().0;
+        callback_env(vec![PromiseResult::Successful(b"no".to_vec())]);
+        let result = spend.on_withdraw_check(shop(), U128(50));
+        assert!(matches!(result, PromiseOrValue::Value(())));
+        assert!(spend.withdraw_pending.is_none());
+        assert_eq!(spend.get_withdraw_inflight().0, before);
     }
 
     #[test]
