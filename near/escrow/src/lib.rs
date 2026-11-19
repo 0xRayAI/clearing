@@ -53,9 +53,13 @@ pub const MIN_AMOUNT: u128 = 1_000_000;
 pub const FEE_BPS: u16 = 0;
 
 const GAS_FT_TRANSFER: Gas = Gas::from_tgas(20);
+const GAS_FT_BALANCE: Gas = Gas::from_tgas(10);
 const GAS_ON_WITHDRAW: Gas = Gas::from_tgas(20);
+const GAS_ON_SETTLE: Gas = Gas::from_tgas(30);
 /// `ft_transfer` plus the callback, with room for the host.
 const MIN_GAS_WITHDRAW: Gas = Gas::from_tgas(80);
+/// Balance read plus `on_settle`.
+const MIN_GAS_SETTLE: Gas = Gas::from_tgas(50);
 const ONE_YOCTO: NearToken = NearToken::from_yoctonear(1);
 const MAX_BPS: u128 = 10_000;
 /// Half, rounding the odd unit to the client.
@@ -116,10 +120,28 @@ struct OpenPayload {
     fund_ns: u64,
 }
 
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PendingStage {
+    Outgoing,
+    Settling,
+}
+
+/// One in-flight withdraw. `settle` reads it once and then removes it.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug)]
+pub struct Pending {
+    pub account: AccountId,
+    pub amount: u128,
+    pub stage: PendingStage,
+}
+
 #[derive(Deserialize)]
 #[serde(crate = "near_sdk::serde")]
 struct FundMsg {
     deal_id: u64,
+    nonce: String,
+    signature: String,
 }
 
 #[near(contract_state)]
@@ -141,6 +163,10 @@ pub struct Escrow {
     balances: LookupMap<AccountId, u128>,
     /// `deal|action|nonce` already accepted.
     used: LookupSet<String>,
+    /// The one debited withdraw whose callback has not finished.
+    pending: Option<Pending>,
+    /// Token units this contract still owes: balances, open deals, and pending withdraws.
+    accounted: u128,
 }
 
 /// `escrow-v1|{chain_id}|{contract_id}|{deal_id}|{action}|{nonce}|{payload}`
@@ -170,6 +196,10 @@ impl Escrow {
         min_window_ns: u64,
     ) -> Self {
         require!(
+            !env::state_exists(),
+            "The contract has already been initialized"
+        );
+        require!(
             cfg!(feature = "sandbox-token")
                 || token_id.as_str() == CIRCLE_USDC_NEAR_TESTNET
                 || token_id.as_str() == CIRCLE_USDC_NEAR_MAINNET,
@@ -180,11 +210,19 @@ impl Escrow {
             "token, arbiter, and creator must be distinct"
         );
         require!(
+            arbiter_id != env::current_account_id() && creator_id != env::current_account_id(),
+            "arbiter and creator must not be the contract"
+        );
+        require!(
             !chain_id.is_empty() && chain_id.len() <= 32 && !chain_id.contains('|'),
             "bad chain_id"
         );
-        require!(min_window_ns > 0 && min_window_ns <= MAX_WINDOW_NS, "bad min window");
-        let creator_pk = decode_fixed::<32>(&creator_pk).unwrap_or_else(|| env::panic_str("bad creator_pk"));
+        require!(
+            min_window_ns > 0 && min_window_ns <= MAX_WINDOW_NS,
+            "bad min window"
+        );
+        let creator_pk =
+            decode_fixed::<32>(&creator_pk).unwrap_or_else(|| env::panic_str("bad creator_pk"));
         Self {
             token_id,
             arbiter_id,
@@ -196,23 +234,36 @@ impl Escrow {
             deals: LookupMap::new(Prefix::Deals),
             balances: LookupMap::new(Prefix::Balances),
             used: LookupSet::new(Prefix::Used),
+            pending: None,
+            accounted: 0,
         }
     }
 
     /// Creator key opens an unpaid deal. The payload is the exact signed JSON.
     /// Windows below `min_window_ns` are refused. `deal_id` in the message is 0.
+    /// The caller pays for the new row. `close_unpaid` keeps the row so `get_deal`
+    /// can still show `Expired`, and does not refund that storage.
+    #[payable]
     pub fn open(&mut self, payload: String, nonce: String, signature: String) -> u64 {
+        let before = env::storage_usage();
         require!(payload.len() <= MAX_PAYLOAD_LEN, "payload too long");
-        let open: OpenPayload =
-            near_sdk::serde_json::from_str(&payload).unwrap_or_else(|_| env::panic_str("bad open payload"));
-        let price: u128 = open.price.parse().unwrap_or_else(|_| env::panic_str("bad price"));
+        let open: OpenPayload = near_sdk::serde_json::from_str(&payload)
+            .unwrap_or_else(|_| env::panic_str("bad open payload"));
+        let price: u128 = open
+            .price
+            .parse()
+            .unwrap_or_else(|_| env::panic_str("bad price"));
         require!(price >= MIN_AMOUNT, "amount below the minimum (1 USDC)");
         self.require_window(open.deliver_ns);
         self.require_window(open.review_ns);
         self.require_window(open.dispute_ns);
         self.require_window(open.fund_ns);
-        let client_pk = decode_fixed::<32>(&open.client_pk).unwrap_or_else(|| env::panic_str("bad client_pk"));
-        require!(client_pk != self.creator_pk, "client key and creator key must differ");
+        let client_pk =
+            decode_fixed::<32>(&open.client_pk).unwrap_or_else(|| env::panic_str("bad client_pk"));
+        require!(
+            client_pk != self.creator_pk,
+            "client key and creator key must differ"
+        );
         self.check_sig(0, "open", &nonce, &payload, &signature, &self.creator_pk);
         self.commit_nonce(0, "open", &nonce);
         let id = self.next_id;
@@ -237,11 +288,16 @@ impl Escrow {
             },
         );
         env::log_str(&format!("escrow:opened|id={id}|price={price}"));
+        // store::LookupMap writes on flush. Measure the new row after that.
+        self.deals.flush();
+        charge_storage(before);
         id
     }
 
-    /// NEP-141 receiver. `msg` is `{"deal_id":N}`. Windows are not read from
-    /// the payer. Anything we will not lock is returned so the token refunds it.
+    /// NEP-141 receiver. `msg` is `{"deal_id":N,"nonce":"...","signature":"..."}`.
+    /// The client key must sign this deal and the paying account. Windows are
+    /// not read from the payer. Anything we will not lock is returned so the
+    /// token refunds it. A plain `ft_transfer` never reaches this method.
     pub fn ft_on_transfer(
         &mut self,
         sender_id: AccountId,
@@ -254,10 +310,10 @@ impl Escrow {
         if amount.0 < MIN_AMOUNT {
             return PromiseOrValue::Value(amount);
         }
-        let Some(deal_id) = parse_fund_msg(&msg) else {
+        let Some(fund) = parse_fund_msg(&msg) else {
             return PromiseOrValue::Value(amount);
         };
-        let Some(mut deal) = self.deals.get(&deal_id).cloned() else {
+        let Some(mut deal) = self.deals.get(&fund.deal_id).cloned() else {
             return PromiseOrValue::Value(amount);
         };
         if deal.state != DealState::Created || sender_id == self.creator_id {
@@ -267,16 +323,27 @@ impl Escrow {
         if now > deal.fund_by_ns || amount.0 < deal.price {
             return PromiseOrValue::Value(amount);
         }
+        if !self.fund_signature_ok(&deal, &sender_id, &fund.nonce, &fund.signature) {
+            return PromiseOrValue::Value(amount);
+        }
+        let Some(accounted) = self.accounted.checked_add(deal.price) else {
+            return PromiseOrValue::Value(amount);
+        };
+        self.commit_nonce(deal.id, "fund", &fund.nonce);
         deal.client = Some(sender_id);
         deal.state = DealState::Funded;
         deal.deliver_by_ns = Some(now.saturating_add(deal.deliver_ns));
         let price = deal.price;
+        let deal_id = deal.id;
+        self.accounted = accounted;
         self.deals.insert(deal_id, deal);
         env::log_str(&format!("escrow:funded|id={deal_id}|price={price}"));
         PromiseOrValue::Value(U128(amount.0 - price))
     }
 
     /// Anyone, after the funding window, if the deal was never paid.
+    /// The row stays. `get_deal` is the history of an expired deal, so this
+    /// does not refund the storage charged at `open`.
     pub fn close_unpaid(&mut self, deal_id: u64) {
         let mut deal = self.deal_or_panic(deal_id);
         require!(deal.state == DealState::Created, "deal must be unpaid");
@@ -301,7 +368,14 @@ impl Escrow {
             !payload.is_empty() && payload.len() <= MAX_HASH_LEN,
             "bad deliverable_hash"
         );
-        self.check_sig(deal_id, "deliver", &nonce, &payload, &signature, &self.creator_pk);
+        self.check_sig(
+            deal_id,
+            "deliver",
+            &nonce,
+            &payload,
+            &signature,
+            &self.creator_pk,
+        );
         self.commit_nonce(deal_id, "deliver", &nonce);
         deal.state = DealState::Delivered;
         deal.deliverable_hash = Some(payload);
@@ -314,7 +388,10 @@ impl Escrow {
         let mut deal = self.deal_or_panic(deal_id);
         require!(deal.state == DealState::Delivered, "deal is not delivered");
         let now = env::block_timestamp();
-        require!(now <= deal.review_ends_ns.unwrap_or(0), "review period is over");
+        require!(
+            now <= deal.review_ends_ns.unwrap_or(0),
+            "review period is over"
+        );
         self.check_sig(deal_id, "accept", &nonce, "", &signature, &deal.client_pk);
         self.commit_nonce(deal_id, "accept", &nonce);
         self.credit(&self.creator_id.clone(), deal.price);
@@ -327,7 +404,10 @@ impl Escrow {
         let mut deal = self.deal_or_panic(deal_id);
         require!(deal.state == DealState::Delivered, "deal is not delivered");
         let ends = deal.review_ends_ns.unwrap_or(u64::MAX);
-        require!(env::block_timestamp() > ends, "review period is not over yet");
+        require!(
+            env::block_timestamp() > ends,
+            "review period is not over yet"
+        );
         self.credit(&self.creator_id.clone(), deal.price);
         deal.state = DealState::Released;
         self.deals.insert(deal_id, deal);
@@ -338,7 +418,10 @@ impl Escrow {
         let mut deal = self.deal_or_panic(deal_id);
         require!(deal.state == DealState::Delivered, "deal is not delivered");
         let now = env::block_timestamp();
-        require!(now <= deal.review_ends_ns.unwrap_or(0), "review period is over");
+        require!(
+            now <= deal.review_ends_ns.unwrap_or(0),
+            "review period is over"
+        );
         self.check_sig(deal_id, "dispute", &nonce, "", &signature, &deal.client_pk);
         self.commit_nonce(deal_id, "dispute", &nonce);
         deal.state = DealState::Disputed;
@@ -356,7 +439,10 @@ impl Escrow {
         creator_signature: String,
         client_signature: String,
     ) {
-        require!(u128::from(split_bps) <= MAX_BPS, "split_bps must be <= 10000");
+        require!(
+            u128::from(split_bps) <= MAX_BPS,
+            "split_bps must be <= 10000"
+        );
         let mut deal = self.deal_or_panic(deal_id);
         let now = env::block_timestamp();
         match deal.state {
@@ -375,17 +461,39 @@ impl Escrow {
             _ => env::panic_str("settle: deal must be Funded, Delivered or Disputed"),
         }
         let payload = split_bps.to_string();
-        self.check_sig(deal_id, "settle", &nonce, &payload, &creator_signature, &self.creator_pk);
-        self.check_sig(deal_id, "settle", &nonce, &payload, &client_signature, &deal.client_pk);
+        self.check_sig(
+            deal_id,
+            "settle",
+            &nonce,
+            &payload,
+            &creator_signature,
+            &self.creator_pk,
+        );
+        self.check_sig(
+            deal_id,
+            "settle",
+            &nonce,
+            &payload,
+            &client_signature,
+            &deal.client_pk,
+        );
         self.commit_nonce(deal_id, "settle", &nonce);
         self.split(&mut deal, u128::from(split_bps));
         self.deals.insert(deal_id, deal);
     }
 
     /// Arbiter, while the dispute window is open. `creator_bps` is 0..=10000.
+    #[payable]
     pub fn resolve_dispute(&mut self, deal_id: u64, creator_bps: u16) {
-        require!(env::predecessor_account_id() == self.arbiter_id, "only the arbiter");
-        require!(u128::from(creator_bps) <= MAX_BPS, "creator_bps must be <= 10000");
+        require!(env::attached_deposit() == ONE_YOCTO, "attach 1 yoctoNEAR");
+        require!(
+            env::predecessor_account_id() == self.arbiter_id,
+            "only the arbiter"
+        );
+        require!(
+            u128::from(creator_bps) <= MAX_BPS,
+            "creator_bps must be <= 10000"
+        );
         let mut deal = self.deal_or_panic(deal_id);
         require!(deal.state == DealState::Disputed, "deal is not disputed");
         let ends = deal.dispute_ends_ns.unwrap_or(0);
@@ -402,7 +510,10 @@ impl Escrow {
         let mut deal = self.deal_or_panic(deal_id);
         require!(deal.state == DealState::Disputed, "deal is not disputed");
         let ends = deal.dispute_ends_ns.unwrap_or(u64::MAX);
-        require!(env::block_timestamp() > ends, "dispute period is not over yet");
+        require!(
+            env::block_timestamp() > ends,
+            "dispute period is not over yet"
+        );
         self.split(&mut deal, TIMEOUT_SPLIT_BPS);
         self.deals.insert(deal_id, deal);
     }
@@ -410,8 +521,14 @@ impl Escrow {
     /// Client account, after the delivery deadline, if nothing was delivered.
     pub fn refund_late(&mut self, deal_id: u64) {
         let mut deal = self.deal_or_panic(deal_id);
-        let client = deal.client.clone().unwrap_or_else(|| env::panic_str("unfunded"));
-        require!(env::predecessor_account_id() == client, "only the client refunds");
+        let client = deal
+            .client
+            .clone()
+            .unwrap_or_else(|| env::panic_str("unfunded"));
+        require!(
+            env::predecessor_account_id() == client,
+            "only the client refunds"
+        );
         require!(deal.state == DealState::Funded, "deal is not still funded");
         require!(
             env::block_timestamp() > deal.deliver_by_ns.unwrap_or(u64::MAX),
@@ -422,18 +539,34 @@ impl Escrow {
         self.deals.insert(deal_id, deal);
     }
 
-    /// Pay the caller's balance out. On a failed `ft_transfer` the callback
-    /// writes the amount back. Attach at least 80 TGas so the callback can run.
+    /// Pay the caller's balance out. The balance row is removed first. On a
+    /// failed `ft_transfer` the callback writes the amount back. If that
+    /// callback never runs, `settle` restores it once. Attach at least 80 TGas.
+    #[payable]
     pub fn withdraw(&mut self) -> Promise {
-        require!(env::prepaid_gas() >= MIN_GAS_WITHDRAW, "attach at least 80 TGas");
+        require!(env::attached_deposit() == ONE_YOCTO, "attach 1 yoctoNEAR");
+        require!(
+            env::prepaid_gas() >= MIN_GAS_WITHDRAW,
+            "attach at least 80 TGas"
+        );
         let caller = env::predecessor_account_id();
         let amount = self.balances.get(&caller).copied().unwrap_or(0);
         require!(amount > 0, "nothing to withdraw");
-        self.balances.insert(caller.clone(), 0);
+        require!(self.pending.is_none(), "withdraw in flight");
+        self.balances.remove(&caller);
+        self.pending = Some(Pending {
+            account: caller.clone(),
+            amount,
+            stage: PendingStage::Outgoing,
+        });
         ext_ft::ext(self.token_id.clone())
             .with_attached_deposit(ONE_YOCTO)
             .with_static_gas(GAS_FT_TRANSFER)
-            .ft_transfer(caller.clone(), U128(amount), Some("escrow withdraw".to_string()))
+            .ft_transfer(
+                caller.clone(),
+                U128(amount),
+                Some("escrow withdraw".to_string()),
+            )
             .then(
                 Self::ext(env::current_account_id())
                     .with_static_gas(GAS_ON_WITHDRAW)
@@ -442,11 +575,116 @@ impl Escrow {
     }
 
     /// Restores `amount` when the transfer receipt did not succeed.
+    /// A missing pending, or a settle already in progress, is left alone.
     #[private]
     pub fn on_withdraw_resolve(&mut self, account_id: AccountId, amount: U128) {
-        if !matches!(env::promise_result(0), PromiseResult::Successful(_)) {
-            self.credit(&account_id, amount.0);
+        let Some(pending) = self.pending.clone() else {
+            return;
+        };
+        if pending.stage != PendingStage::Outgoing
+            || pending.account != account_id
+            || pending.amount != amount.0
+        {
+            return;
         }
+        let ok = matches!(env::promise_result(0), PromiseResult::Successful(_));
+        self.pending = None;
+        if ok {
+            self.accounted = self.accounted.saturating_sub(pending.amount);
+            return;
+        }
+        if !self.restore(&account_id, pending.amount) {
+            self.pending = Some(pending);
+        }
+    }
+
+    /// Reconcile one stuck withdraw. Does not transfer. Restores the internal
+    /// credit when the token balance still covers every accounted liability.
+    /// Otherwise the tokens already left, and the credit stays off.
+    #[payable]
+    pub fn settle_pending(&mut self) -> Promise {
+        require!(env::attached_deposit() == ONE_YOCTO, "attach 1 yoctoNEAR");
+        require!(
+            env::prepaid_gas() >= MIN_GAS_SETTLE,
+            "attach at least 50 TGas"
+        );
+        let caller = env::predecessor_account_id();
+        let Some(mut pending) = self
+            .pending
+            .clone()
+            .filter(|pending| pending.account == caller)
+        else {
+            env::panic_str("nothing pending");
+        };
+        require!(
+            pending.stage == PendingStage::Outgoing,
+            "settle already in progress"
+        );
+        require!(pending.account == caller, "pending account mismatch");
+        pending.stage = PendingStage::Settling;
+        self.pending = Some(pending);
+        ext_ft::ext(self.token_id.clone())
+            .with_static_gas(GAS_FT_BALANCE)
+            .ft_balance_of(env::current_account_id())
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_ON_SETTLE)
+                    .on_settle(caller),
+            )
+    }
+
+    /// Applies `settle` once. A failed balance read puts the pending back.
+    /// One withdraw is in flight, so this amount is the only shortfall match.
+    #[private]
+    pub fn on_settle(&mut self, account_id: AccountId) {
+        let Some(pending) = self
+            .pending
+            .clone()
+            .filter(|pending| pending.account == account_id)
+        else {
+            return;
+        };
+        if pending.stage != PendingStage::Settling || pending.account != account_id {
+            return;
+        }
+        let token_balance = match env::promise_result(0) {
+            PromiseResult::Successful(bytes) => {
+                match near_sdk::serde_json::from_slice::<U128>(&bytes) {
+                    Ok(value) => value.0,
+                    Err(_) => {
+                        self.reopen_pending(account_id, pending);
+                        return;
+                    }
+                }
+            }
+            _ => {
+                self.reopen_pending(account_id, pending);
+                return;
+            }
+        };
+        let shortfall = self.accounted.saturating_sub(token_balance);
+        if shortfall != 0 && shortfall != pending.amount {
+            self.reopen_pending(account_id, pending);
+            return;
+        }
+        self.pending = None;
+        if shortfall == 0 {
+            if !self.restore(&account_id, pending.amount) {
+                self.reopen_pending(account_id, pending);
+            }
+            return;
+        }
+        self.accounted = self.accounted.saturating_sub(pending.amount);
+        env::log_str(&format!(
+            "escrow:settled|account={account_id}|amount={}",
+            pending.amount
+        ));
+    }
+
+    pub fn get_pending(&self, account_id: AccountId) -> Option<Pending> {
+        self.pending
+            .clone()
+            .filter(|pending| pending.account == account_id)
     }
 
     pub fn get_deal(&self, deal_id: u64) -> Option<Deal> {
@@ -482,11 +720,22 @@ impl Escrow {
 #[allow(dead_code)]
 trait FungibleToken {
     fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>);
+    fn ft_balance_of(&self, account_id: AccountId) -> U128;
 }
 
-fn parse_fund_msg(msg: &str) -> Option<u64> {
-    let parsed: FundMsg = near_sdk::serde_json::from_str(msg).ok()?;
-    Some(parsed.deal_id)
+fn parse_fund_msg(msg: &str) -> Option<FundMsg> {
+    near_sdk::serde_json::from_str(msg).ok()
+}
+
+fn charge_storage(before: u64) {
+    let used = env::storage_usage().saturating_sub(before);
+    let required = env::storage_byte_cost().saturating_mul(u128::from(used));
+    let attached = env::attached_deposit();
+    require!(attached >= required, "attach enough NEAR for storage");
+    let refund = attached.saturating_sub(required);
+    if !refund.is_zero() {
+        Promise::new(env::predecessor_account_id()).transfer(refund);
+    }
 }
 
 fn decode_fixed<const N: usize>(hex_str: &str) -> Option<[u8; N]> {
@@ -531,7 +780,10 @@ impl Escrow {
     }
 
     fn deal_or_panic(&self, deal_id: u64) -> Deal {
-        self.deals.get(&deal_id).cloned().unwrap_or_else(|| env::panic_str("unknown deal"))
+        self.deals
+            .get(&deal_id)
+            .cloned()
+            .unwrap_or_else(|| env::panic_str("unknown deal"))
     }
 
     fn check_sig(
@@ -555,7 +807,8 @@ impl Escrow {
             nonce,
             payload,
         );
-        let signature = decode_fixed::<64>(signature_hex).unwrap_or_else(|| env::panic_str("bad signature"));
+        let signature =
+            decode_fixed::<64>(signature_hex).unwrap_or_else(|| env::panic_str("bad signature"));
         require!(
             env::ed25519_verify(&signature, message.as_bytes(), public_key),
             "invalid signature"
@@ -565,6 +818,62 @@ impl Escrow {
     fn commit_nonce(&mut self, deal_id: u64, action: &str, nonce: &str) {
         let key = format!("{deal_id}|{action}|{nonce}");
         require!(self.used.insert(key), "replayed signature");
+    }
+
+    /// Client key signs `escrow-v1|...|fund|{nonce}|{sender}`. A mismatch refunds.
+    fn fund_signature_ok(
+        &self,
+        deal: &Deal,
+        sender: &AccountId,
+        nonce: &str,
+        signature_hex: &str,
+    ) -> bool {
+        if !(16..=64).contains(&nonce.len()) || !nonce.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return false;
+        }
+        let Some(signature) = decode_fixed::<64>(signature_hex) else {
+            return false;
+        };
+        let message = signed_message(
+            &self.chain_id,
+            env::current_account_id().as_str(),
+            deal.id,
+            "fund",
+            nonce,
+            sender.as_str(),
+        );
+        if !env::ed25519_verify(&signature, message.as_bytes(), &deal.client_pk) {
+            return false;
+        }
+        let key = format!("{}|fund|{nonce}", deal.id);
+        !self.used.contains(&key)
+    }
+
+    /// Failure-path credit. Returns false instead of panicking on overflow.
+    fn restore(&mut self, account: &AccountId, amount: u128) -> bool {
+        let Some(next) = self
+            .balances
+            .get(account)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(amount)
+        else {
+            return false;
+        };
+        if next == 0 {
+            self.balances.remove(account);
+        } else {
+            self.balances.insert(account.clone(), next);
+        }
+        true
+    }
+
+    fn reopen_pending(&mut self, account_id: AccountId, mut pending: Pending) {
+        if pending.account != account_id {
+            return;
+        }
+        pending.stage = PendingStage::Outgoing;
+        self.pending = Some(pending);
     }
 
     fn credit(&mut self, account: &AccountId, amount: u128) {
@@ -614,7 +923,10 @@ mod tests {
     fn key(fill: u8) -> Key {
         let secret = [fill; 32];
         let signing = SigningKey::from_bytes(&secret);
-        Key { secret, public_hex: hex_encode(&signing.verifying_key().to_bytes()) }
+        Key {
+            secret,
+            public_hex: hex_encode(&signing.verifying_key().to_bytes()),
+        }
     }
 
     fn sign(key: &Key, message: &str) -> String {
@@ -639,12 +951,17 @@ mod tests {
     }
 
     fn set_caller(predecessor: AccountId, now: u64) {
+        set_caller_deposit(predecessor, now, NearToken::from_yoctonear(0));
+    }
+
+    fn set_caller_deposit(predecessor: AccountId, now: u64, deposit: NearToken) {
         let ctx = VMContextBuilder::new()
             .current_account_id(escrow_id())
             .predecessor_account_id(predecessor.clone())
             .signer_account_id(predecessor)
             .block_timestamp(now)
             .account_balance(NearToken::from_near(50))
+            .attached_deposit(deposit)
             .prepaid_gas(Gas::from_tgas(300))
             .build();
         testing_env!(ctx);
@@ -657,16 +974,36 @@ mod tests {
             .block_timestamp(now)
             .prepaid_gas(Gas::from_tgas(300))
             .build();
-        testing_env!(ctx, test_vm_config(), RuntimeFeesConfig::test(), Default::default(), vec![result]);
+        testing_env!(
+            ctx,
+            test_vm_config(),
+            RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![result]
+        );
     }
 
     fn contract() -> Escrow {
         set_caller(arbiter(), 0);
-        Escrow::new(token(), arbiter(), creator(), key(1).public_hex, "testnet".into(), WINDOW)
+        Escrow::new(
+            token(),
+            arbiter(),
+            creator(),
+            key(1).public_hex,
+            "testnet".into(),
+            WINDOW,
+        )
     }
 
     fn message(deal_id: u64, action: &str, nonce: &str, payload: &str) -> String {
-        signed_message("testnet", escrow_id().as_str(), deal_id, action, nonce, payload)
+        signed_message(
+            "testnet",
+            escrow_id().as_str(),
+            deal_id,
+            action,
+            nonce,
+            payload,
+        )
     }
 
     fn open_payload(client_key: &Key, price: u128) -> String {
@@ -679,18 +1016,34 @@ mod tests {
     fn open_deal(escrow: &mut Escrow, payload: &str, nonce: &str) -> u64 {
         let creator_key = key(1);
         let signature = sign(&creator_key, &message(0, "open", nonce, payload));
-        set_caller(creator(), 0);
+        set_caller_deposit(creator(), 0, NearToken::from_near(1));
         escrow.open(payload.to_string(), nonce.to_string(), signature)
     }
 
-    fn fund(escrow: &mut Escrow, deal_id: u64, amount: u128, now: u64) -> u128 {
+    fn fund_msg(deal_id: u64, payer: &AccountId, nonce: &str, client_key: &Key) -> String {
+        let signature = sign(client_key, &message(deal_id, "fund", nonce, payer.as_str()));
+        format!(r#"{{"deal_id":{deal_id},"nonce":"{nonce}","signature":"{signature}"}}"#)
+    }
+
+    fn fund_as(
+        escrow: &mut Escrow,
+        payer: AccountId,
+        deal_id: u64,
+        amount: u128,
+        now: u64,
+        client_key: &Key,
+    ) -> u128 {
+        let nonce = format!("noncefund{deal_id:08}{now:08}");
+        let msg = fund_msg(deal_id, &payer, &nonce, client_key);
         set_caller(token(), now);
-        let PromiseOrValue::Value(refund) =
-            escrow.ft_on_transfer(client(), U128(amount), format!(r#"{{"deal_id":{deal_id}}}"#))
-        else {
+        let PromiseOrValue::Value(refund) = escrow.ft_on_transfer(payer, U128(amount), msg) else {
             panic!("refund must be a value, not a promise");
         };
         refund.0
+    }
+
+    fn fund(escrow: &mut Escrow, deal_id: u64, amount: u128, now: u64) -> u128 {
+        fund_as(escrow, client(), deal_id, amount, now, &key(2))
     }
 
     fn deliver(escrow: &mut Escrow, deal_id: u64, now: u64, nonce: &str) {
@@ -924,7 +1277,7 @@ mod tests {
         set_caller(client(), 20);
         escrow.dispute(1, "noncedispute000001".to_string(), signature);
         let ends = escrow.get_deal(1).unwrap().dispute_ends_ns.unwrap();
-        set_caller(arbiter(), ends);
+        set_caller_deposit(arbiter(), ends, ONE_YOCTO);
         escrow.resolve_dispute(1, 7_000);
         assert_eq!(escrow.get_balance(creator()).0, 700_000);
         assert_eq!(escrow.get_balance(client()).0, 300_000);
@@ -983,7 +1336,13 @@ mod tests {
         let creator_sig = sign(&key(1), &message(1, "settle", nonce, body));
         let client_sig = sign(&key(2), &message(1, "settle", nonce, body));
         set_caller("anyone.testnet".parse().unwrap(), 10);
-        escrow.settle(1, nonce.to_string(), 4_000, creator_sig.clone(), client_sig.clone());
+        escrow.settle(
+            1,
+            nonce.to_string(),
+            4_000,
+            creator_sig.clone(),
+            client_sig.clone(),
+        );
         assert_eq!(escrow.get_balance(creator()).0, 400_000);
         assert_eq!(escrow.get_balance(client()).0, 600_000);
         assert_eq!(escrow.get_deal(1).unwrap().state, DealState::Released);
@@ -1046,14 +1405,251 @@ mod tests {
         fund(&mut escrow, 1, PRICE, 1);
         deliver(&mut escrow, 1, 10, "noncedeliver000001");
         accept(&mut escrow, 1, 20, "nonceaccept0000001");
-        set_caller(creator(), 30);
+        set_caller_deposit(creator(), 30, ONE_YOCTO);
         let _promise = escrow.withdraw();
         assert_eq!(escrow.get_balance(creator()).0, 0);
+        assert!(!escrow.balances.contains_key(&creator()));
         set_callback(31, PromiseResult::Failed);
         escrow.on_withdraw_resolve(creator(), U128(PRICE));
         assert_eq!(escrow.get_balance(creator()).0, PRICE);
         set_callback(32, PromiseResult::Successful(Vec::new()));
         escrow.on_withdraw_resolve(creator(), U128(PRICE));
         assert_eq!(escrow.get_balance(creator()).0, PRICE);
+    }
+
+    #[test]
+    fn a_payer_who_is_not_signed_by_the_client_key_is_refunded() {
+        let mut escrow = contract();
+        let payload = open_payload(&key(2), PRICE);
+        open_deal(&mut escrow, &payload, "nonceopen00000001");
+        let stranger: AccountId = "stranger.testnet".parse().unwrap();
+        let wrong_key = fund_as(&mut escrow, stranger.clone(), 1, PRICE, 1, &key(9));
+        assert_eq!(wrong_key, PRICE);
+        assert_eq!(escrow.get_deal(1).unwrap().state, DealState::Created);
+        assert!(escrow.get_deal(1).unwrap().client.is_none());
+
+        let nonce = "noncefundfront00001";
+        let msg = fund_msg(1, &client(), nonce, &key(2));
+        set_caller(token(), 2);
+        let PromiseOrValue::Value(front_run) = escrow.ft_on_transfer(stranger, U128(PRICE), msg)
+        else {
+            panic!("value");
+        };
+        assert_eq!(front_run.0, PRICE);
+        assert_eq!(escrow.get_deal(1).unwrap().state, DealState::Created);
+        assert_eq!(escrow.get_balance(client()).0, 0);
+    }
+
+    #[test]
+    fn the_payer_signed_by_the_client_key_funds_the_deal() {
+        let mut escrow = contract();
+        let payload = open_payload(&key(2), PRICE);
+        open_deal(&mut escrow, &payload, "nonceopen00000001");
+        let refund = fund(&mut escrow, 1, PRICE, 1);
+        assert_eq!(refund, 0);
+        let deal = escrow.get_deal(1).unwrap();
+        assert_eq!(deal.state, DealState::Funded);
+        assert_eq!(deal.client, Some(client()));
+        assert_eq!(escrow.accounted, PRICE);
+    }
+
+    #[test]
+    fn resolve_dispute_rejects_a_call_with_no_deposit() {
+        let mut escrow = contract();
+        let payload = open_payload(&key(2), PRICE);
+        open_deal(&mut escrow, &payload, "nonceopen00000001");
+        fund(&mut escrow, 1, PRICE, 1);
+        deliver(&mut escrow, 1, 10, "noncedeliver000001");
+        let signature = sign(&key(2), &message(1, "dispute", "noncedispute000001", ""));
+        set_caller(client(), 20);
+        escrow.dispute(1, "noncedispute000001".to_string(), signature);
+        let ends = escrow.get_deal(1).unwrap().dispute_ends_ns.unwrap();
+        set_caller(arbiter(), ends);
+        let rejected = catch_unwind(AssertUnwindSafe(|| escrow.resolve_dispute(1, 7_000)));
+        assert!(rejected.is_err());
+        assert_eq!(escrow.get_deal(1).unwrap().state, DealState::Disputed);
+        assert_eq!(escrow.get_balance(creator()).0, 0);
+        assert_eq!(escrow.get_balance(client()).0, 0);
+    }
+
+    #[test]
+    fn a_second_new_panics() {
+        let escrow = contract();
+        near_sdk::env::storage_write(b"STATE", &[1]);
+        set_caller(arbiter(), 1);
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            Escrow::new(
+                token(),
+                arbiter(),
+                creator(),
+                key(1).public_hex,
+                "testnet".into(),
+                WINDOW,
+            );
+        }));
+        near_sdk::env::storage_remove(b"STATE");
+        assert!(caught.is_err());
+        assert_eq!(escrow.get_creator_pk(), key(1).public_hex);
+    }
+
+    #[test]
+    fn init_rejects_creator_or_arbiter_equal_to_the_contract() {
+        set_caller(arbiter(), 0);
+        let creator_is_contract = catch_unwind(AssertUnwindSafe(|| {
+            Escrow::new(
+                token(),
+                arbiter(),
+                escrow_id(),
+                key(1).public_hex,
+                "testnet".into(),
+                WINDOW,
+            );
+        }));
+        assert!(creator_is_contract.is_err());
+        set_caller(arbiter(), 0);
+        let arbiter_is_contract = catch_unwind(AssertUnwindSafe(|| {
+            Escrow::new(
+                token(),
+                escrow_id(),
+                creator(),
+                key(1).public_hex,
+                "testnet".into(),
+                WINDOW,
+            );
+        }));
+        assert!(arbiter_is_contract.is_err());
+    }
+
+    #[test]
+    fn open_without_a_storage_deposit_is_rejected() {
+        let mut escrow = contract();
+        let payload = open_payload(&key(2), PRICE);
+        let nonce = "nonceopen00000001";
+        let signature = sign(&key(1), &message(0, "open", nonce, &payload));
+        set_caller(creator(), 0);
+        let rejected = catch_unwind(AssertUnwindSafe(|| {
+            escrow.open(payload, nonce.to_string(), signature);
+        }));
+        assert!(rejected.is_err());
+    }
+
+    fn balance_result(amount: u128) -> PromiseResult {
+        PromiseResult::Successful(near_sdk::serde_json::to_vec(&U128(amount)).expect("json"))
+    }
+
+    #[test]
+    fn settle_restores_a_stuck_pending_once() {
+        let mut escrow = contract();
+        let payload = open_payload(&key(2), PRICE);
+        open_deal(&mut escrow, &payload, "nonceopen00000001");
+        fund(&mut escrow, 1, PRICE, 1);
+        deliver(&mut escrow, 1, 10, "noncedeliver000001");
+        accept(&mut escrow, 1, 20, "nonceaccept0000001");
+        set_caller_deposit(creator(), 30, ONE_YOCTO);
+        let _promise = escrow.withdraw();
+        assert_eq!(escrow.get_balance(creator()).0, 0);
+        let pending = escrow.get_pending(creator()).expect("pending");
+        assert_eq!(pending.amount, PRICE);
+        assert_eq!(pending.stage, PendingStage::Outgoing);
+        assert_eq!(pending.account, creator());
+
+        set_caller_deposit(creator(), 40, ONE_YOCTO);
+        let _settle = escrow.settle_pending();
+        set_callback(41, balance_result(PRICE));
+        escrow.on_settle(creator());
+        assert_eq!(escrow.get_balance(creator()).0, PRICE);
+        assert!(escrow.get_pending(creator()).is_none());
+
+        set_callback(42, balance_result(PRICE));
+        escrow.on_settle(creator());
+        assert_eq!(escrow.get_balance(creator()).0, PRICE);
+
+        set_caller_deposit(creator(), 43, ONE_YOCTO);
+        let again = catch_unwind(AssertUnwindSafe(|| escrow.settle_pending()));
+        assert!(again.is_err());
+        assert_eq!(escrow.get_balance(creator()).0, PRICE);
+        assert_eq!(escrow.accounted, PRICE);
+    }
+
+    #[test]
+    fn settle_does_not_credit_when_the_tokens_already_left() {
+        let mut escrow = contract();
+        let payload = open_payload(&key(2), PRICE);
+        open_deal(&mut escrow, &payload, "nonceopen00000001");
+        fund(&mut escrow, 1, PRICE, 1);
+        deliver(&mut escrow, 1, 10, "noncedeliver000001");
+        accept(&mut escrow, 1, 20, "nonceaccept0000001");
+        set_caller_deposit(creator(), 30, ONE_YOCTO);
+        let _promise = escrow.withdraw();
+        set_caller_deposit(creator(), 40, ONE_YOCTO);
+        let _settle = escrow.settle_pending();
+        set_callback(41, balance_result(0));
+        escrow.on_settle(creator());
+        assert_eq!(escrow.get_balance(creator()).0, 0);
+        assert!(escrow.get_pending(creator()).is_none());
+        assert_eq!(escrow.accounted, 0);
+        set_callback(42, balance_result(PRICE));
+        escrow.on_settle(creator());
+        assert_eq!(escrow.get_balance(creator()).0, 0);
+    }
+
+    #[test]
+    fn withdraw_rejects_a_zero_deposit() {
+        let mut escrow = contract();
+        let payload = open_payload(&key(2), PRICE);
+        open_deal(&mut escrow, &payload, "nonceopen00000001");
+        fund(&mut escrow, 1, PRICE, 1);
+        deliver(&mut escrow, 1, 10, "noncedeliver000001");
+        accept(&mut escrow, 1, 20, "nonceaccept0000001");
+        set_caller(creator(), 30);
+        let rejected = catch_unwind(AssertUnwindSafe(|| escrow.withdraw()));
+        assert!(rejected.is_err());
+        assert_eq!(escrow.get_balance(creator()).0, PRICE);
+        assert!(escrow.get_pending(creator()).is_none());
+        assert_eq!(escrow.accounted, PRICE);
+    }
+
+    #[test]
+    fn a_second_withdraw_is_rejected_while_one_is_pending() {
+        let mut escrow = contract();
+        let payload = open_payload(&key(2), PRICE);
+        open_deal(&mut escrow, &payload, "nonceopen00000001");
+        fund(&mut escrow, 1, PRICE, 1);
+        let nonce = "noncesettle0000001";
+        let body = "5000";
+        let creator_sig = sign(&key(1), &message(1, "settle", nonce, body));
+        let client_sig = sign(&key(2), &message(1, "settle", nonce, body));
+        set_caller("anyone.testnet".parse().unwrap(), 10);
+        escrow.settle(1, nonce.to_string(), 5_000, creator_sig, client_sig);
+        assert_eq!(escrow.get_balance(creator()).0, 500_000);
+        assert_eq!(escrow.get_balance(client()).0, 500_000);
+
+        set_caller_deposit(creator(), 20, ONE_YOCTO);
+        let _creator = escrow.withdraw();
+        assert_eq!(escrow.get_balance(creator()).0, 0);
+        assert_eq!(escrow.get_pending(creator()).expect("pending").amount, 500_000);
+
+        set_caller_deposit(client(), 21, ONE_YOCTO);
+        let blocked = catch_unwind(AssertUnwindSafe(|| escrow.withdraw()));
+        assert!(blocked.is_err());
+        assert_eq!(escrow.get_balance(client()).0, 500_000);
+        assert!(escrow.get_pending(client()).is_none());
+        assert_eq!(escrow.get_pending(creator()).expect("pending").amount, 500_000);
+        assert_eq!(escrow.accounted, PRICE);
+
+        set_caller_deposit(creator(), 30, ONE_YOCTO);
+        let _settle = escrow.settle_pending();
+        set_callback(31, balance_result(500_000));
+        escrow.on_settle(creator());
+        assert!(escrow.get_pending(creator()).is_none());
+        assert_eq!(escrow.get_balance(creator()).0, 0);
+        assert_eq!(escrow.accounted, 500_000);
+        assert_eq!(escrow.get_balance(client()).0, 500_000);
+
+        set_caller_deposit(client(), 40, ONE_YOCTO);
+        let _client = escrow.withdraw();
+        assert_eq!(escrow.get_balance(client()).0, 0);
+        assert_eq!(escrow.get_pending(client()).expect("pending").amount, 500_000);
+        assert!(escrow.get_pending(creator()).is_none());
     }
 }

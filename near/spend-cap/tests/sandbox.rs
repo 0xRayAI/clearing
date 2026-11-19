@@ -13,22 +13,24 @@ use std::sync::OnceLock;
 const CAP: u128 = 1_000_000;
 const SEC: u64 = 1_000_000_000;
 
-fn build_wasm(manifest: &str, artifact: &str) -> Vec<u8> {
+fn build_wasm(manifest: &str, artifact: &str, feature: Option<&str>) -> Vec<u8> {
     let target = std::env::temp_dir().join(format!("clearing-spend-{artifact}"));
-    let status = Command::new(env!("CARGO"))
-        .args([
-            "build",
-            "--locked",
-            "--release",
-            "--target",
-            "wasm32-unknown-unknown",
-            "--manifest-path",
-            manifest,
-            "--target-dir",
-            target.to_str().expect("utf8 target dir"),
-        ])
-        .status()
-        .expect("spawn cargo");
+    let mut cmd = Command::new(env!("CARGO"));
+    cmd.args([
+        "build",
+        "--locked",
+        "--release",
+        "--target",
+        "wasm32-unknown-unknown",
+        "--manifest-path",
+        manifest,
+        "--target-dir",
+        target.to_str().expect("utf8 target dir"),
+    ]);
+    if let Some(feature) = feature {
+        cmd.args(["--features", feature]);
+    }
+    let status = cmd.status().expect("spawn cargo");
     assert!(status.success(), "wasm build failed for {manifest}");
     let path = target.join(format!("wasm32-unknown-unknown/release/{artifact}.wasm"));
     std::fs::read(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
@@ -42,13 +44,26 @@ fn manifest(rel: &str) -> String {
 
 fn vault_wasm() -> &'static [u8] {
     static WASM: OnceLock<Vec<u8>> = OnceLock::new();
-    WASM.get_or_init(|| build_wasm(&manifest("Cargo.toml"), "clearing_spend_cap")).as_slice()
+    WASM.get_or_init(|| {
+        build_wasm(
+            &manifest("Cargo.toml"),
+            "clearing_spend_cap",
+            Some("sandbox-token"),
+        )
+    })
+    .as_slice()
 }
 
 fn token_wasm() -> &'static [u8] {
     static WASM: OnceLock<Vec<u8>> = OnceLock::new();
-    WASM.get_or_init(|| build_wasm(&manifest("../escrow/tests/ft/Cargo.toml"), "clearing_escrow_token"))
-        .as_slice()
+    WASM.get_or_init(|| {
+        build_wasm(
+            &manifest("../escrow/tests/ft/Cargo.toml"),
+            "clearing_escrow_token",
+            None,
+        )
+    })
+    .as_slice()
 }
 
 struct Rig {
@@ -69,7 +84,14 @@ async fn rig_with(budget_limit: u128, budget_period_ns: u64, mint_amount: u128) 
     let vault = worker.dev_deploy(vault_wasm()).await.expect("vault");
     let owner = worker.dev_create_account().await.expect("owner");
     let shop = worker.dev_create_account().await.expect("shop");
-    must(token.call("new").gas(Gas::from_tgas(50)).transact().await.expect("token init"));
+    must(
+        token
+            .call("new")
+            .gas(Gas::from_tgas(50))
+            .transact()
+            .await
+            .expect("token init"),
+    );
     must(
         owner
             .call(vault.id(), "new")
@@ -93,7 +115,13 @@ async fn rig_with(budget_limit: u128, budget_period_ns: u64, mint_amount: u128) 
     if mint_amount > 0 {
         mint(&token, vault.id(), mint_amount).await;
     }
-    Rig { worker, token, vault, owner, shop }
+    Rig {
+        worker,
+        token,
+        vault,
+        owner,
+        shop,
+    }
 }
 
 async fn mint(token: &Contract, account: &AccountId, amount: u128) {
@@ -109,7 +137,12 @@ async fn mint(token: &Contract, account: &AccountId, amount: u128) {
 }
 
 async fn register(payer: &Account, token: &Contract, account: &AccountId) {
-    let bounds: serde_json::Value = token.view("storage_balance_bounds").await.expect("bounds").json().expect("json");
+    let bounds: serde_json::Value = token
+        .view("storage_balance_bounds")
+        .await
+        .expect("bounds")
+        .json()
+        .expect("json");
     let min: u128 = bounds["min"].as_str().expect("min").parse().unwrap();
     must(
         payer
@@ -123,8 +156,14 @@ async fn register(payer: &Account, token: &Contract, account: &AccountId) {
     );
 }
 
-fn must(outcome: near_workspaces::result::ExecutionFinalResult) -> near_workspaces::result::ExecutionFinalResult {
-    assert!(outcome.is_success(), "call failed: {:?}", outcome.failures());
+fn must(
+    outcome: near_workspaces::result::ExecutionFinalResult,
+) -> near_workspaces::result::ExecutionFinalResult {
+    assert!(
+        outcome.is_success(),
+        "call failed: {:?}",
+        outcome.failures()
+    );
     outcome
 }
 
@@ -221,7 +260,13 @@ async fn budget_released_on_failed_transfer() {
         "an empty vault must fail the transfer: {:?}",
         failed.failures()
     );
-    let reserved: String = rig.vault.view("get_reserved").await.expect("view").json().expect("json");
+    let reserved: String = rig
+        .vault
+        .view("get_reserved")
+        .await
+        .expect("view")
+        .json()
+        .expect("json");
     assert_eq!(reserved, "0");
     mint(&rig.token, rig.vault.id(), CAP).await;
     must(pay(&rig, CAP, "nonce-after-release").await);
@@ -246,7 +291,8 @@ async fn agent_key_cannot_call_ft_transfer() {
         rig.owner
             .call(rig.vault.id(), "add_agent_key")
             .args_json(json!({ "public_key": public.to_string() }))
-            .gas(Gas::from_tgas(50))
+            .deposit(NearToken::from_yoctonear(1))
+            .gas(Gas::from_tgas(80))
             .transact()
             .await
             .expect("add key"),
@@ -265,7 +311,11 @@ async fn agent_key_cannot_call_ft_transfer() {
         .transact()
         .await;
     if let Ok(outcome) = direct {
-        assert!(!outcome.is_success(), "agent key must not call ft_transfer: {:?}", outcome.failures());
+        assert!(
+            !outcome.is_success(),
+            "agent key must not call ft_transfer: {:?}",
+            outcome.failures()
+        );
     }
     assert_eq!(balance(&rig.token, rig.vault.id()).await, 10_000_000);
 
@@ -283,9 +333,17 @@ async fn agent_key_cannot_call_ft_transfer() {
             .expect("agent pay"),
     );
     assert!(through.logs().join("\n").contains("nonce-via-agent-key"));
-    let methods: String = rig.vault.view("get_agent_methods").await.expect("methods").json().expect("json");
+    let methods: String = rig
+        .vault
+        .view("get_agent_methods")
+        .await
+        .expect("methods")
+        .json()
+        .expect("json");
     assert_eq!(methods, AGENT_METHODS);
-    assert!(!AGENT_METHODS.split(',').any(|name| name == "ft_transfer" || name == "confirm" || name == "withdraw"));
+    assert!(!AGENT_METHODS
+        .split(',')
+        .any(|name| name == "ft_transfer" || name == "confirm" || name == "withdraw"));
 }
 
 #[tokio::test]
@@ -293,7 +351,12 @@ async fn empty_allowlist_pay_to_unregistered_releases_without_storage() {
     let rig = rig(5_000_000, 60 * SEC).await;
     let fresh = rig.worker.dev_create_account().await.expect("fresh");
     let tokens_before = balance(&rig.token, rig.vault.id()).await;
-    let near_before = rig.worker.view_account(rig.vault.id()).await.expect("account").balance;
+    let near_before = rig
+        .worker
+        .view_account(rig.vault.id())
+        .await
+        .expect("account")
+        .balance;
     let failed = rig
         .owner
         .call(rig.vault.id(), "pay")
@@ -306,13 +369,30 @@ async fn empty_allowlist_pay_to_unregistered_releases_without_storage() {
         .transact()
         .await
         .expect("pay submitted");
-    assert!(!failed.receipt_failures().is_empty(), "unregistered pay must fail: {:?}", failed.failures());
+    assert!(
+        !failed.receipt_failures().is_empty(),
+        "unregistered pay must fail: {:?}",
+        failed.failures()
+    );
     assert_eq!(balance(&rig.token, rig.vault.id()).await, tokens_before);
     assert_eq!(balance(&rig.token, fresh.id()).await, 0);
-    let reserved: String = rig.vault.view("get_reserved").await.expect("view").json().expect("json");
+    let reserved: String = rig
+        .vault
+        .view("get_reserved")
+        .await
+        .expect("view")
+        .json()
+        .expect("json");
     assert_eq!(reserved, "0");
-    let near_after = rig.worker.view_account(rig.vault.id()).await.expect("account").balance;
-    let dropped = near_before.as_yoctonear().saturating_sub(near_after.as_yoctonear());
+    let near_after = rig
+        .worker
+        .view_account(rig.vault.id())
+        .await
+        .expect("account")
+        .balance;
+    let dropped = near_before
+        .as_yoctonear()
+        .saturating_sub(near_after.as_yoctonear());
     assert!(
         dropped < 1_250_000_000_000_000_000_000,
         "vault NEAR dropped by {dropped}, storage deposit is 0.00125 NEAR"
@@ -327,6 +407,7 @@ async fn allowlisted_unregistered_receiver_succeeds() {
         rig.owner
             .call(rig.vault.id(), "set_allow")
             .args_json(json!({ "allow": [fresh.id()] }))
+            .deposit(NearToken::from_yoctonear(1))
             .transact()
             .await
             .expect("allow"),
@@ -373,14 +454,27 @@ async fn owner_withdraw_restores_on_failure_then_pays_out() {
     );
     assert_eq!(balance(&rig.token, rig.vault.id()).await, before);
     assert_eq!(balance(&rig.token, fresh.id()).await, 0);
-    let inflight: String = rig.vault.view("get_withdraw_inflight").await.expect("view").json().expect("json");
+    let inflight: String = rig
+        .vault
+        .view("get_withdraw_inflight")
+        .await
+        .expect("view")
+        .json()
+        .expect("json");
     assert_eq!(inflight, "0");
-    let spent: String = rig.vault.view("get_spent").await.expect("view").json().expect("json");
+    let spent: String = rig
+        .vault
+        .view("get_spent")
+        .await
+        .expect("view")
+        .json()
+        .expect("json");
     assert_eq!(spent, "0");
     must(
         rig.owner
             .call(rig.vault.id(), "set_allow")
             .args_json(json!({ "allow": [fresh.id()] }))
+            .deposit(NearToken::from_yoctonear(1))
             .transact()
             .await
             .expect("allow"),
@@ -402,7 +496,13 @@ async fn owner_withdraw_restores_on_failure_then_pays_out() {
     );
     assert_eq!(balance(&rig.token, fresh.id()).await, out);
     assert_eq!(balance(&rig.token, rig.vault.id()).await, before - out);
-    let spent_after: String = rig.vault.view("get_spent").await.expect("view").json().expect("json");
+    let spent_after: String = rig
+        .vault
+        .view("get_spent")
+        .await
+        .expect("view")
+        .json()
+        .expect("json");
     assert_eq!(spent_after, "0");
 }
 
@@ -415,7 +515,8 @@ async fn agent_key_cannot_withdraw() {
         rig.owner
             .call(rig.vault.id(), "add_agent_key")
             .args_json(json!({ "public_key": public.to_string() }))
-            .gas(Gas::from_tgas(50))
+            .deposit(NearToken::from_yoctonear(1))
+            .gas(Gas::from_tgas(80))
             .transact()
             .await
             .expect("add key"),
@@ -434,10 +535,20 @@ async fn agent_key_cannot_withdraw() {
         .transact()
         .await;
     if let Ok(outcome) = direct {
-        assert!(!outcome.is_success(), "agent key must not withdraw: {:?}", outcome.failures());
+        assert!(
+            !outcome.is_success(),
+            "agent key must not withdraw: {:?}",
+            outcome.failures()
+        );
     }
     assert_eq!(balance(&rig.token, rig.vault.id()).await, before);
-    let methods: String = rig.vault.view("get_agent_methods").await.expect("methods").json().expect("json");
+    let methods: String = rig
+        .vault
+        .view("get_agent_methods")
+        .await
+        .expect("methods")
+        .json()
+        .expect("json");
     assert_eq!(methods, AGENT_METHODS);
     assert!(!methods.split(',').any(|name| name == "withdraw"));
 }
